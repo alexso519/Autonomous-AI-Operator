@@ -1,0 +1,68 @@
+# Personal AI Agent Workspace - Development Environment
+# One command: docker compose up --build
+
+services:
+
+  # ─── Backend: FastAPI with auto-reload ───────────────────────
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: ai-backend
+    ports:
+      - "8000:8000"
+    volumes:
+      # Bind-mount source for uvicorn --reload to detect changes
+      - ./backend/app:/app/app
+      # Persistent SQLite storage (use a Docker named volume on Windows to avoid
+      # host filesystem locking / permission issues with SQLite WAL)
+      - backend_data:/app/data
+    environment:
+      - OLLAMA_URL=http://ollama:11434
+      - DATABASE_PATH=/app/data/workflows.db
+      - PYTHONDONTWRITEBYTECODE=1
+    depends_on:
+      - ollama
+    networks:
+      - workspace-net
+
+  # ─── Frontend: Next.js dev server with hot reload ────────────
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: ai-frontend
+    ports:
+      - "3000:3000"
+    volumes:
+      # Bind-mount source for Next.js fast refresh
+      - ./frontend:/app
+      # Preserve container node_modules so host bind doesn't override them
+      - /app/node_modules
+      - /app/.next
+    environment:
+      - NEXT_PUBLIC_API_URL=http://localhost:8000
+    depends_on:
+      - backend
+    networks:
+      - workspace-net
+
+  # ─── Ollama: Local LLM ─────────────────────────────────────
+  ollama:
+    image: ollama/ollama:latest
+    container_name: ai-ollama
+    ports:
+      - "11434:11434"
+    volumes:
+      # Persistent model storage (won't re-download on restart)
+      - ollama_models:/root/.ollama
+    networks:
+      - workspace-net
+
+volumes:
+  ollama_models:
+  backend_data:
+
+networks:
+  workspace-net:
+    driver: bridge
