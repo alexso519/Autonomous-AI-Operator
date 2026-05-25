@@ -1,97 +1,213 @@
 """
-Context manager — passes outputs between sequentially executed agents.
+Shared execution context manager.
 
-Strategy (intentionally simple):
-  - Each agent receives the combined output of ALL previously executed agents.
-  - This gives every downstream agent full visibility into the conversation so far.
-  - Outputs are accumulated in a dict keyed by node_id.
+This manager maintains workflow-level and node-level memory, stores
+intermediate agent outputs, and can persist shared state into SQLite.
 
-No complex DAG resolution or selective context passing — just append and forward.
+Memory model:
+  - Initial workflow context
+  - Workflow-level shared memory
+  - Per-node memory / metadata
+  - Agent outputs keyed by node_id
+  - Approval decisions and execution metadata
+
+The goal is stable, deterministic shared state that downstream agents
+can consume without introducing external memory systems.
 """
 
+import json
 import logging
+from datetime import datetime, timezone
 from typing import Any
+
+from app.database.database import get_db
 
 logger = logging.getLogger(__name__)
 
 
 class ContextManager:
     """
-    Accumulates agent outputs during sequential workflow execution.
+    Accumulates shared workflow state during sequential execution.
 
-    Usage:
-        ctx = ContextManager()
-        ctx.set_context("initial task description ...")
-
-        # After each agent completes:
-        ctx.add_output("node_1", "Research findings ...")
-
-        # Next agent gets all prior context:
-        prior = ctx.get_combined_context()  # "initial ... [Researcher]: Research findings ..."
+    Provides a deterministic inspection model for replay, debugging,
+    and approval-resume execution.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, execution_id: str | None = None) -> None:
+        self.execution_id = execution_id
         self._initial_context: str = ""
-        self._outputs: dict[str, str] = {}
+        self._workflow_memory: dict[str, Any] = {}
+        self._node_memory: dict[str, dict[str, Any]] = {}
+        self._outputs: dict[str, dict[str, Any]] = {}
+        self._approval_memory: dict[str, dict[str, Any]] = {}
 
     def set_context(self, context: str) -> None:
-        """Set the initial workflow-level context (e.g. workflow description)."""
+        """Set the initial workflow-level context."""
         self._initial_context = context.strip()
 
     def get_initial_context(self) -> str:
         """Return the initial workflow-level context."""
         return self._initial_context
 
-    def add_output(self, node_id: str, agent_name: str, output: str) -> None:
-        """
-        Store the output from a completed agent node.
+    def set_workflow_memory(self, key: str, value: Any) -> None:
+        """Store a workflow-level memory item."""
+        self._workflow_memory[key] = value
+        logger.debug("Workflow memory set: %s", key)
 
-        Args:
-            node_id: The canvas node identifier.
-            agent_name: Human-readable agent name (for log formatting).
-            output: The raw text output from the agent.
-        """
-        if output and output.strip():
-            formatted = f"[{agent_name}]: {output.strip()}"
-        else:
-            formatted = f"[{agent_name}]: (no output)"
-        self._outputs[node_id] = formatted
-        logger.debug("Context stored for node %s (%s)", node_id, agent_name)
+    def get_workflow_memory(self, key: str, default: Any = None) -> Any:
+        """Retrieve a workflow-level memory item."""
+        return self._workflow_memory.get(key, default)
+
+    def merge_workflow_memory(self, memory: dict[str, Any]) -> None:
+        """Merge a batch of workflow memory entries."""
+        self._workflow_memory.update(memory)
+        logger.debug("Workflow memory merged: %s", list(memory.keys()))
+
+    def add_node_memory(self, node_id: str, key: str, value: Any) -> None:
+        """Store metadata for a specific node."""
+        node = self._node_memory.setdefault(node_id, {})
+        node[key] = value
+        logger.debug("Node memory set: %s.%s", node_id, key)
+
+    def get_node_memory(self, node_id: str) -> dict[str, Any]:
+        """Return all memory stored for a single node."""
+        return dict(self._node_memory.get(node_id, {}))
+
+    def add_output(
+        self,
+        node_id: str,
+        agent_name: str,
+        output: str,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        """Store the output and metadata from a completed agent node."""
+        raw_text = output.strip() if output and output.strip() else "(no output)"
+        self._outputs[node_id] = {
+            "agent_name": agent_name,
+            "output": raw_text,
+            "metadata": metadata or {},
+        }
+        self.add_node_memory(node_id, "agent_name", agent_name)
+        self.add_node_memory(node_id, "output", raw_text)
+        if metadata:
+            self.add_node_memory(node_id, "metadata", metadata)
+        self.set_workflow_memory("last_agent", agent_name)
+        self.set_workflow_memory("last_node_id", node_id)
+        logger.debug("Context output stored for node %s (%s)", node_id, agent_name)
+
+    def add_approval_decision(
+        self,
+        node_id: str,
+        decision: str,
+        notes: str | None = None,
+        decided_by: str = "user",
+    ) -> None:
+        """Store approval decisions in workflow memory."""
+        entry = {
+            "decision": decision,
+            "notes": notes or "",
+            "decided_by": decided_by,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+        self._approval_memory[node_id] = entry
+        self.set_workflow_memory("last_approval", {"node_id": node_id, "decision": decision})
+        logger.debug("Approval memory stored for node %s: %s", node_id, decision)
 
     def get_combined_context(self) -> str:
-        """
-        Return all accumulated context as a single string.
-
-        This is what gets passed to each new agent before execution.
-        """
+        """Return the combined shared context passed to downstream agents."""
         parts: list[str] = []
 
         if self._initial_context:
             parts.append(f"Workflow Context:\n{self._initial_context}")
 
+        if self._workflow_memory:
+            parts.append("\nShared Workflow Memory:")
+            for key, value in self._workflow_memory.items():
+                formatted = json.dumps(value, ensure_ascii=False) if not isinstance(value, str) else value
+                parts.append(f"- {key}: {formatted}")
+
         if self._outputs:
             parts.append("\nPrevious Agent Outputs:")
-            for node_id in self._outputs:
-                parts.append(self._outputs[node_id])
+            for node_id, entry in self._outputs.items():
+                parts.append(f"[{entry['agent_name']}]: {entry['output']}")
 
         return "\n\n".join(parts)
 
     def get_latest_output(self) -> str:
-        """
-        Return the most recent agent output only.
-        Useful for single-step context or debugging.
-        """
+        """Return the most recent agent output only."""
         if not self._outputs:
             return ""
         last_key = list(self._outputs.keys())[-1]
-        return self._outputs[last_key]
+        return self._outputs[last_key]["output"]
 
     def get_all_outputs(self) -> dict[str, str]:
-        """Return all stored outputs keyed by node_id."""
-        return dict(self._outputs)
+        """Return raw outputs keyed by node_id."""
+        return {node_id: data["output"] for node_id, data in self._outputs.items()}
+
+    def get_state(self) -> dict[str, Any]:
+        """Return the full shared memory state for persistence."""
+        return {
+            "initial_context": self._initial_context,
+            "workflow_memory": self._workflow_memory,
+            "node_memory": self._node_memory,
+            "outputs": self._outputs,
+            "approval_memory": self._approval_memory,
+        }
+
+    def restore_state(self, state: dict[str, Any]) -> None:
+        """Restore shared memory from a persisted state dictionary."""
+        self._initial_context = state.get("initial_context", "")
+        self._workflow_memory = state.get("workflow_memory", {}) or {}
+        self._node_memory = state.get("node_memory", {}) or {}
+        self._outputs = state.get("outputs", {}) or {}
+        self._approval_memory = state.get("approval_memory", {}) or {}
+        logger.debug("Context manager state restored")
+
+    async def persist(self) -> None:
+        """Persist shared memory into the execution record."""
+        if not self.execution_id:
+            logger.debug("No execution_id available; skipping persistence")
+            return
+
+        db = await get_db()
+        await db.execute(
+            "UPDATE executions SET shared_memory = ? WHERE id = ?",
+            (json.dumps(self.get_state(), ensure_ascii=False), self.execution_id),
+        )
+        await db.commit()
+        logger.debug("Shared execution memory persisted for %s", self.execution_id)
+
+    @classmethod
+    async def load_from_db(cls, execution_id: str) -> "ContextManager":
+        """Load shared execution memory from the executions table."""
+        ctx = cls(execution_id=execution_id)
+        db = await get_db()
+        cursor = await db.execute(
+            "SELECT shared_memory FROM executions WHERE id = ?",
+            (execution_id,),
+        )
+        row = await cursor.fetchone()
+        if row is None:
+            return ctx
+
+        raw = dict(row).get("shared_memory")
+        if not raw:
+            return ctx
+
+        try:
+            state = json.loads(raw)
+            ctx.restore_state(state)
+        except Exception:
+            logger.warning(
+                "Failed to load shared memory for execution %s", execution_id
+            )
+        return ctx
 
     def reset(self) -> None:
-        """Clear all context (for a fresh workflow run)."""
+        """Clear all shared context state."""
         self._initial_context = ""
+        self._workflow_memory = {}
+        self._node_memory = {}
         self._outputs = {}
+        self._approval_memory = {}
         logger.debug("Context manager reset")

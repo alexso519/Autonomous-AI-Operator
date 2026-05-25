@@ -54,6 +54,12 @@ from app.database.database import get_db
 from app.execution.agent_factory import build_agent
 from app.execution.context_manager import ContextManager
 from app.execution.manager import execution_manager
+from app.execution.reflection_service import ReflectionService, ReplanningService
+from app.execution.runtime_state import (
+    RuntimeState,
+    init_execution_state,
+    transition_execution_state,
+)
 from app.streaming.event_manager import event_manager, StreamEvent
 
 logger = logging.getLogger(__name__)
@@ -155,6 +161,30 @@ async def _end_stream(execution_id: str) -> None:
         await event_manager.emit(execution_id, None)
 
 
+async def _record_runtime_state(
+    execution_id: str,
+    to_state: RuntimeState,
+    reason: str | None = None,
+    metadata: dict[str, Any] | None = None,
+    from_state: RuntimeState | str | None = None,
+) -> None:
+    """Persist a runtime state transition without breaking execution."""
+    try:
+        await _record_runtime_state(
+            execution_id=execution_id,
+            to_state=to_state,
+            reason=reason,
+            metadata=metadata,
+            from_state=from_state,
+        )
+    except Exception as exc:
+        logger.warning(
+            "Could not persist runtime state transition for %s: %s",
+            execution_id,
+            exc,
+        )
+
+
 # ── Cancellation check ───────────────────────────────────────────
 
 
@@ -173,6 +203,12 @@ async def _check_cancelled(
             "Execution %s cancelled at boundary (node=%s)",
             execution_id,
             node_name,
+        )
+        await _record_runtime_state(
+            execution_id=execution_id,
+            to_state=RuntimeState.CANCELLED,
+            reason=f"Execution cancelled at node '{node_name}'",
+            metadata={"nodeName": node_name},
         )
         try:
             await _emit(
@@ -234,8 +270,7 @@ async def _save_checkpoint(
         "workflow_description": workflow_description,
         "nodes": sorted_nodes,
         "edges": edges,
-        "context_outputs": ctx.get_all_outputs(),
-        "context_initial": ctx.get_initial_context(),
+        "context_state": ctx.get_state(),
         "logs": logs,
         "steps": steps,
     }
@@ -304,6 +339,27 @@ async def _handle_approval_node(
 
     now = datetime.now(timezone.utc).isoformat()
     approval_id = uuid.uuid4().hex[:12]
+
+    # Add a checkpoint memory marker for the approval pause
+    ctx.add_approval_decision(
+        node_id=node_id,
+        decision="pending",
+        notes=node_data.get("reason", "Approval required"),
+    )
+    await ctx.persist()
+
+    await _record_runtime_state(
+        execution_id=execution_id,
+        to_state=RuntimeState.WAITING_APPROVAL,
+        reason="Execution paused for human approval",
+        metadata={
+            "nodeId": node_id,
+            "agentName": agent_name,
+            "approvalReason": node_data.get(
+                "reason", "Proceed with workflow execution?"
+            ),
+        },
+    )
 
     # Save checkpoint
     await _save_checkpoint(
@@ -519,6 +575,7 @@ async def _execute_agent_step(
 
         completed_now = datetime.now(timezone.utc).isoformat()
         ctx.add_output(node_id, agent_name, output_text)
+        await ctx.persist()
 
         # Check cancellation after agent execution
         if await _check_cancelled(
@@ -727,6 +784,64 @@ async def _run_agent_with_timeout(
         ) from None
 
 
+async def _run_reflection_and_replanning(
+    execution_id: str,
+    node: dict[str, Any],
+    idx: int,
+    sorted_nodes: list[dict[str, Any]],
+    edges: list[dict[str, Any]],
+    ctx: ContextManager,
+    logs: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Evaluate output quality and insert recovery steps when needed."""
+    finding = ReflectionService.inspect_output(node, ctx)
+    if not finding.should_replan:
+        if finding.action == "max_retries_reached":
+            await _emit(
+                execution_id,
+                "reflection_limit_reached",
+                "system",
+                f"Reflection limit reached for {finding.agent_name}: {finding.reason}",
+                nodeId=finding.node_id,
+                issues=finding.issues,
+            )
+        return sorted_nodes
+
+    sorted_nodes = ReplanningService.insert_recovery_steps(
+        sorted_nodes=sorted_nodes,
+        edges=edges,
+        node_index=idx - 1,
+        node=node,
+        finding=finding,
+        ctx=ctx,
+    )
+    await ctx.persist()
+
+    message = (
+        f"Reflection detected weak output for {finding.agent_name}. "
+        f"Injected recovery workflow steps: {finding.action}."
+    )
+    await _emit(
+        execution_id,
+        "reflection_action",
+        "system",
+        message,
+        nodeId=finding.node_id,
+        issues=finding.issues,
+        action=finding.action,
+        retryCount=finding.retry_count + 1,
+    )
+
+    logs.append({
+        "id": uuid.uuid4().hex[:12],
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "level": "warning",
+        "agentName": "system",
+        "content": message,
+    })
+    return sorted_nodes
+
+
 # ── Core execution ──────────────────────────────────────────────
 
 
@@ -791,8 +906,20 @@ async def execute_workflow(
     await event_manager.create_stream(execution_id)
 
     # Initialize context
-    ctx = ContextManager()
+    ctx = ContextManager(execution_id=execution_id)
     ctx.set_context(workflow_description)
+    await ctx.persist()
+
+    await init_execution_state(
+        execution_id=execution_id,
+        workflow_id=workflow_id,
+        initial_state=RuntimeState.RUNNING,
+        reason="Execution started",
+        metadata={
+            "workflowName": workflow_name,
+            "agentCount": agent_count,
+        },
+    )
 
     logs: list[dict[str, Any]] = []
     steps: list[dict[str, Any]] = []
@@ -877,10 +1004,28 @@ async def execute_workflow(
             final_error = error
             break
 
+        sorted_nodes = await _run_reflection_and_replanning(
+            execution_id=execution_id,
+            node=node,
+            idx=idx,
+            sorted_nodes=sorted_nodes,
+            edges=edges,
+            ctx=ctx,
+            logs=logs,
+        )
+        agent_count = len(sorted_nodes)
+
     # Finalise execution record
     completed_now = datetime.now(timezone.utc).isoformat()
 
     if final_status == "completed":
+        await _record_runtime_state(
+            execution_id=execution_id,
+            to_state=RuntimeState.COMPLETED,
+            reason="Workflow completed successfully",
+            metadata={"workflowName": workflow_name},
+        )
+
         completion_log = {
             "id": uuid.uuid4().hex[:12],
             "timestamp": completed_now,
@@ -935,6 +1080,13 @@ async def execute_workflow(
         await db.commit()
 
     elif final_status == "cancelled":
+        await _record_runtime_state(
+            execution_id=execution_id,
+            to_state=RuntimeState.CANCELLED,
+            reason="Workflow execution cancelled",
+            metadata={"workflowName": workflow_name},
+        )
+
         await _emit(
             execution_id,
             "workflow_cancelled",
@@ -965,6 +1117,13 @@ async def execute_workflow(
             f"Failed at step: {steps[-1]['agentName'] if steps else 'unknown'}"
             f" — {final_error[:300]}"
         )
+        await _record_runtime_state(
+            execution_id=execution_id,
+            to_state=RuntimeState.FAILED,
+            reason="Workflow execution failed",
+            metadata={"workflowName": workflow_name},
+        )
+
         await db.execute(
             """UPDATE executions
                SET status = 'failed', completed_at = ?,
@@ -1025,21 +1184,25 @@ async def resume_workflow(
     steps: list[dict[str, Any]] = checkpoint.get("steps", [])
 
     # Recreate context from checkpoint
-    ctx = ContextManager()
-    if checkpoint.get("context_initial"):
-        ctx.set_context(checkpoint["context_initial"])
-    for node_id, output_text in checkpoint.get(
-        "context_outputs", {}
-    ).items():
-        parts = output_text.split("]: ", 1)
-        agent_name = (
-            parts[0].lstrip("[") if len(parts) > 1 else "Agent"
-        )
-        ctx.add_output(
-            node_id,
-            agent_name,
-            parts[1] if len(parts) > 1 else output_text,
-        )
+    ctx = ContextManager(execution_id=execution_id)
+    if checkpoint.get("context_state"):
+        ctx.restore_state(checkpoint["context_state"])
+    else:
+        ctx = ContextManager(execution_id=execution_id)
+        if checkpoint.get("context_initial"):
+            ctx.set_context(checkpoint["context_initial"])
+        for node_id, output_text in checkpoint.get(
+            "context_outputs", {}
+        ).items():
+            parts = output_text.split("]: ", 1)
+            agent_name = (
+                parts[0].lstrip("[") if len(parts) > 1 else "Agent"
+            )
+            ctx.add_output(
+                node_id,
+                agent_name,
+                parts[1] if len(parts) > 1 else output_text,
+            )
 
     agent_count = len(sorted_nodes)
     now = datetime.now(timezone.utc).isoformat()
@@ -1063,6 +1226,16 @@ async def resume_workflow(
     )
     await db.commit()
 
+    await _record_runtime_state(
+        execution_id=execution_id,
+        to_state=RuntimeState.RUNNING,
+        reason="Execution resumed after approval",
+        metadata={
+            "currentIdx": current_idx,
+            "approvalNodeId": sorted_nodes[current_idx - 1].get("id"),
+        },
+    )
+
     # Emit: approval_granted
     approval_node_data = sorted_nodes[current_idx - 1].get("data", {})
     approval_name = approval_node_data.get("label", "Approval Gate")
@@ -1074,6 +1247,13 @@ async def resume_workflow(
         f'✅ Approval granted for "{approval_name}" — resuming execution',
         nodeId=sorted_nodes[current_idx - 1].get("id"),
     )
+
+    ctx.add_approval_decision(
+        node_id=sorted_nodes[current_idx - 1].get("id"),
+        decision="approved",
+        notes=f"Resumed after approval for {approval_name}",
+    )
+    await ctx.persist()
 
     grant_log = {
         "id": uuid.uuid4().hex[:12],
@@ -1164,10 +1344,28 @@ async def resume_workflow(
             final_error = error
             break
 
+        sorted_nodes = await _run_reflection_and_replanning(
+            execution_id=execution_id,
+            node=node,
+            idx=idx,
+            sorted_nodes=sorted_nodes,
+            edges=edges,
+            ctx=ctx,
+            logs=logs,
+        )
+        agent_count = len(sorted_nodes)
+
     # Finalise
     completed_now = datetime.now(timezone.utc).isoformat()
 
     if final_status == "completed":
+        await _record_runtime_state(
+            execution_id=execution_id,
+            to_state=RuntimeState.COMPLETED,
+            reason="Workflow completed successfully",
+            metadata={"workflowName": workflow_name},
+        )
+
         await _emit(
             execution_id,
             "workflow_completed",
@@ -1202,6 +1400,13 @@ async def resume_workflow(
         await db.commit()
 
     elif final_status == "cancelled":
+        await _record_runtime_state(
+            execution_id=execution_id,
+            to_state=RuntimeState.CANCELLED,
+            reason="Workflow execution cancelled",
+            metadata={"workflowName": workflow_name},
+        )
+
         await _emit(
             execution_id,
             "workflow_cancelled",
@@ -1219,6 +1424,13 @@ async def resume_workflow(
         await db.commit()
 
     elif final_status == "failed":
+        await _record_runtime_state(
+            execution_id=execution_id,
+            to_state=RuntimeState.FAILED,
+            reason="Workflow execution failed",
+            metadata={"workflowName": workflow_name},
+        )
+
         await _emit(
             execution_id,
             "workflow_failed",
@@ -1286,6 +1498,27 @@ async def reject_execution(execution_id: str) -> dict[str, Any]:
         (now, execution_id),
     )
     await db.commit()
+
+    await _record_runtime_state(
+        execution_id=execution_id,
+        to_state=RuntimeState.REJECTED,
+        reason="Execution rejected by user",
+        metadata={"rejectedAt": now},
+    )
+
+    # Persist rejection into shared memory if available
+    if checkpoint:
+        try:
+            ctx = await ContextManager.load_from_db(execution_id)
+            approval_node = checkpoint.get("nodes", [])[checkpoint.get("current_idx", 1) - 1]
+            ctx.add_approval_decision(
+                node_id=approval_node.get("id", "unknown"),
+                decision="rejected",
+                notes="Execution rejected by user",
+            )
+            await ctx.persist()
+        except Exception:
+            logger.debug("Unable to persist approval rejection memory for %s", execution_id)
 
     # Get approval name from checkpoint
     if checkpoint:

@@ -80,13 +80,17 @@ async def _init_tables(conn: aiosqlite.Connection) -> None:
         )""",
         # ── Execution Logs ─────────────────────────────────
         """CREATE TABLE IF NOT EXISTS executions (
-            id          TEXT PRIMARY KEY,
-            workflow_id TEXT NOT NULL,
-            status      TEXT NOT NULL DEFAULT 'pending',
-            started_at  TEXT,
-            completed_at TEXT,
-            output      TEXT DEFAULT '{}',
-            error       TEXT,
+            id            TEXT PRIMARY KEY,
+            workflow_id   TEXT NOT NULL,
+            workflow_name TEXT NOT NULL DEFAULT '',
+            status        TEXT NOT NULL DEFAULT 'pending',
+            started_at    TEXT,
+            completed_at  TEXT,
+            checkpoint    TEXT DEFAULT NULL,
+            output        TEXT DEFAULT '{}',
+            summary       TEXT DEFAULT '',
+            shared_memory TEXT DEFAULT '{}',
+            error         TEXT,
             FOREIGN KEY (workflow_id) REFERENCES workflows(id)
         )""",
         # ── Execution Steps (per-node logs) ────────────────
@@ -126,7 +130,34 @@ async def _init_tables(conn: aiosqlite.Connection) -> None:
             data          TEXT NOT NULL DEFAULT '{}',
             FOREIGN KEY (execution_id) REFERENCES executions(id)
         )""",
+        # ── Tool Call Audit Trail ─────────────────────────────
+        """CREATE TABLE IF NOT EXISTS tool_calls (
+            id               TEXT PRIMARY KEY,
+            execution_id     TEXT NOT NULL,
+            node_id          TEXT NOT NULL,
+            tool_name        TEXT NOT NULL,
+            category         TEXT NOT NULL,
+            permission_level TEXT NOT NULL,
+            approval_required INTEGER NOT NULL DEFAULT 0,
+            approved         INTEGER NOT NULL DEFAULT 0,
+            status           TEXT NOT NULL DEFAULT 'pending',
+            input            TEXT NOT NULL DEFAULT '{}',
+            output           TEXT NOT NULL DEFAULT '{}',
+            error            TEXT DEFAULT '',
+            timestamp        TEXT NOT NULL DEFAULT (datetime('now')),
+            FOREIGN KEY (execution_id) REFERENCES executions(id)
+        )""",
         # ── Execution Summaries ──────────────────────────────
+        """CREATE TABLE IF NOT EXISTS execution_state_transitions (
+            id            TEXT PRIMARY KEY,
+            execution_id  TEXT NOT NULL,
+            timestamp     TEXT NOT NULL,
+            from_state    TEXT NOT NULL,
+            to_state      TEXT NOT NULL,
+            reason        TEXT DEFAULT '',
+            metadata      TEXT NOT NULL DEFAULT '{}',
+            FOREIGN KEY (execution_id) REFERENCES executions(id)
+        )""",
         """CREATE TABLE IF NOT EXISTS execution_summaries (
             id            TEXT PRIMARY KEY,
             execution_id  TEXT NOT NULL UNIQUE,
@@ -143,22 +174,6 @@ async def _init_tables(conn: aiosqlite.Connection) -> None:
         )""",
     ]
 
-    # ── Migrate executions table to add checkpoint column ──
-    # This is safe to run multiple times — IF NOT EXISTS for column add
-    for migration_sql in [
-        """ALTER TABLE executions ADD COLUMN checkpoint TEXT DEFAULT NULL""",
-        """ALTER TABLE executions ADD COLUMN workflow_name TEXT DEFAULT ''""",
-        """ALTER TABLE executions ADD COLUMN summary TEXT DEFAULT ''""",
-        """CREATE INDEX IF NOT EXISTS idx_event_logs_execution_id
-           ON execution_event_logs(execution_id)""",
-        """CREATE INDEX IF NOT EXISTS idx_executions_workflow_id
-           ON executions(workflow_id)""",
-    ]:
-        try:
-            await conn.execute(migration_sql)
-        except Exception as e:
-            logger.debug("Migration skipped (likely already exists): %s", e)
-
     # Create all tables with error handling
     for table_sql in tables:
         try:
@@ -166,6 +181,27 @@ async def _init_tables(conn: aiosqlite.Connection) -> None:
             logger.debug("Table created or already exists")
         except Exception as e:
             logger.warning("Error creating table (continuing): %s", e)
+
+    # ── Migrate executions table to add checkpoint column and indexes ──
+    # This is safe to run multiple times — IF NOT EXISTS for column add
+    for migration_sql in [
+        """ALTER TABLE executions ADD COLUMN checkpoint TEXT DEFAULT NULL""",
+        """ALTER TABLE executions ADD COLUMN workflow_name TEXT DEFAULT ''""",
+        """ALTER TABLE executions ADD COLUMN summary TEXT DEFAULT ''""",
+        """ALTER TABLE executions ADD COLUMN shared_memory TEXT DEFAULT '{}'""",
+        """CREATE INDEX IF NOT EXISTS idx_event_logs_execution_id
+           ON execution_event_logs(execution_id)""",
+        """CREATE INDEX IF NOT EXISTS idx_executions_workflow_id
+           ON executions(workflow_id)""",
+        """CREATE INDEX IF NOT EXISTS idx_tool_calls_execution_id
+           ON tool_calls(execution_id)""",
+        """CREATE INDEX IF NOT EXISTS idx_execution_state_transitions_execution_id
+           ON execution_state_transitions(execution_id)""",
+    ]:
+        try:
+            await conn.execute(migration_sql)
+        except Exception as e:
+            logger.debug("Migration skipped (likely already exists): %s", e)
 
     try:
         await conn.commit()

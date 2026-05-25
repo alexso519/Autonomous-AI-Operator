@@ -386,6 +386,26 @@ class ExecutionManager:
                 reg.workflow_id,
             )
 
+        # Persist runtime state for cancellation
+        try:
+            from app.execution.runtime_state import (
+                RuntimeState,
+                transition_execution_state,
+            )
+
+            await transition_execution_state(
+                execution_id=execution_id,
+                to_state=RuntimeState.CANCELLED,
+                reason="Cancelled by user",
+                metadata={"markDbCancelled": mark_db_cancelled},
+            )
+        except Exception as exc:
+            logger.debug(
+                "Could not persist cancellation state for %s: %s",
+                execution_id,
+                exc,
+            )
+
         # Update DB status if requested
         if mark_db_cancelled:
             try:
@@ -646,6 +666,25 @@ async def recover_orphaned_executions() -> int:
                     execution_id,
                 ),
             )
+            try:
+                from app.execution.runtime_state import (
+                    RuntimeState,
+                    transition_execution_state,
+                )
+
+                await transition_execution_state(
+                    execution_id=execution_id,
+                    to_state=RuntimeState.ORPHANED,
+                    reason="Server restart detected orphaned execution",
+                    metadata={"previousStatus": row["status"]},
+                )
+            except Exception as exc:
+                logger.debug(
+                    "Could not persist orphaned state for %s: %s",
+                    execution_id,
+                    exc,
+                )
+
             count += 1
             logger.warning(
                 "Marked orphaned execution: %s (%s)",

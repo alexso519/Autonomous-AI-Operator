@@ -42,6 +42,7 @@ router = APIRouter(prefix="/api/executions", tags=["executions"])
 
 def _row_to_execution(row: dict[str, Any]) -> dict[str, Any]:
     """Convert a DB execution row to the API response format."""
+    shared_memory = row.get("shared_memory")
     return {
         "id": row["id"],
         "workflowId": row["workflow_id"],
@@ -52,6 +53,7 @@ def _row_to_execution(row: dict[str, Any]) -> dict[str, Any]:
         "error": row.get("error"),
         "output": json.loads(row.get("output", "{}")),
         "summary": row.get("summary", ""),
+        "sharedMemory": json.loads(shared_memory) if shared_memory else {},
     }
 
 
@@ -79,6 +81,31 @@ async def _fetch_steps_for_execution(
             "output": r["output"],
             "startedAt": r["started_at"],
             "completedAt": r["completed_at"],
+        }
+        for r in rows
+    ]
+
+
+async def _fetch_state_history_for_execution(
+    execution_id: str,
+) -> list[dict[str, Any]]:
+    db = await get_db()
+    cursor = await db.execute(
+        """SELECT id, timestamp, from_state, to_state, reason, metadata
+           FROM execution_state_transitions
+           WHERE execution_id = ?
+           ORDER BY timestamp ASC, id ASC""",
+        (execution_id,),
+    )
+    rows = await cursor.fetchall()
+    return [
+        {
+            "id": r["id"],
+            "timestamp": r["timestamp"],
+            "fromState": r["from_state"],
+            "toState": r["to_state"],
+            "reason": r["reason"],
+            "metadata": json.loads(r["metadata"] or "{}"),
         }
         for r in rows
     ]
@@ -270,7 +297,7 @@ async def get_execution(execution_id: str) -> dict[str, Any]:
     db = await get_db()
     cursor = await db.execute(
         """SELECT id, workflow_id, workflow_name, status, started_at,
-                  completed_at, error, output, summary
+                  completed_at, error, output, summary, shared_memory
            FROM executions WHERE id = ?""",
         (execution_id,),
     )
@@ -281,10 +308,12 @@ async def get_execution(execution_id: str) -> dict[str, Any]:
     execution = _row_to_execution(dict(row))
     steps = await _fetch_steps_for_execution(execution_id)
     approvals = await _fetch_approvals_for_execution(execution_id)
+    state_history = await _fetch_state_history_for_execution(execution_id)
     summary = await _compute_execution_summary(execution_id)
 
     execution["steps"] = steps
     execution["approvals"] = approvals
+    execution["stateHistory"] = state_history
     execution["summary"] = summary
 
     return execution

@@ -35,6 +35,13 @@ from app.execution.manager import (
     RegisteredTask,
     recover_orphaned_executions,
 )
+from app.execution.runtime_state import (
+    RuntimeState,
+    get_latest_state,
+    get_state_history,
+    init_execution_state,
+    transition_execution_state,
+)
 
 __all__ = [
     # Engine
@@ -51,4 +58,10 @@ __all__ = [
     "ExecutionStatus",
     "RegisteredTask",
     "recover_orphaned_executions",
+    # Runtime state machine
+    "RuntimeState",
+    "get_latest_state",
+    "get_state_history",
+    "init_execution_state",
+    "transition_execution_state",
 ]
