@@ -1,5 +1,6 @@
 from typing import Any
 
+from app.tools.tool_safety import permission_level_for
 from app.tools.tool_models import (
     FileDeleteInput,
     FileDeleteOutput,
@@ -17,6 +18,10 @@ from app.tools.tool_models import (
     ShellCommandOutput,
     StructuredDataExtractorInput,
     StructuredDataExtractorOutput,
+    WebSearchInput,
+    WebSearchOutput,
+    WebpageFetchInput,
+    WebpageFetchOutput,
     ToolDefinition,
     ToolBaseInput,
     CalculatorInput,
@@ -48,93 +53,111 @@ class ToolRegistry:
 
 tool_registry = ToolRegistry()
 
-# Safe tools
-for definition in [
-    ToolDefinition(
-        name="calculator",
-        description="Deterministic arithmetic evaluation for safe numeric calculations.",
-        category="safe",
-        permission_level="safe",
-        input_model=CalculatorInput,
-        output_model=CalculatorOutput,
-        requires_approval=False,
-    ),
-    ToolDefinition(
-        name="json_transform",
-        description="Deterministic JSON restructuring and extraction operations.",
-        category="safe",
-        permission_level="safe",
-        input_model=JsonTransformInput,
-        output_model=JsonTransformOutput,
-        requires_approval=False,
-    ),
-    ToolDefinition(
-        name="markdown_generator",
-        description="Generate structured markdown from titles, sections, and raw content.",
-        category="safe",
-        permission_level="safe",
-        input_model=MarkdownGeneratorInput,
-        output_model=MarkdownGeneratorOutput,
-        requires_approval=False,
-    ),
-    ToolDefinition(
-        name="structured_data_extractor",
-        description="Extract structured values from raw text using deterministic regex patterns.",
-        category="safe",
-        permission_level="safe",
-        input_model=StructuredDataExtractorInput,
-        output_model=StructuredDataExtractorOutput,
-        requires_approval=False,
-    ),
-    ToolDefinition(
-        name="file_reader",
-        description="Read-only sandboxed file access for safe content inspection.",
-        category="safe",
-        permission_level="restricted",
-        input_model=FileReaderInput,
-        output_model=FileReaderOutput,
-        requires_approval=False,
-    ),
-]:
-    tool_registry.register(definition)
 
-# Approval-gated tools
-for definition in [
-    ToolDefinition(
-        name="shell_command",
-        description="Execute an allowlisted shell command in a sandboxed environment.",
-        category="approval_required",
-        permission_level="approval_required",
-        input_model=ShellCommandInput,
-        output_model=ShellCommandOutput,
-        requires_approval=True,
-    ),
-    ToolDefinition(
-        name="file_write",
-        description="Write file content to an approved sandboxed path.",
-        category="approval_required",
-        permission_level="approval_required",
-        input_model=FileWriteInput,
-        output_model=FileWriteOutput,
-        requires_approval=True,
-    ),
-    ToolDefinition(
-        name="file_delete",
-        description="Delete a sandboxed file path after explicit approval.",
-        category="approval_required",
-        permission_level="approval_required",
-        input_model=FileDeleteInput,
-        output_model=FileDeleteOutput,
-        requires_approval=True,
-    ),
-    ToolDefinition(
-        name="http_post",
-        description="Send an HTTP POST request after explicit approval.",
-        category="approval_required",
-        permission_level="approval_required",
-        input_model=HttpPostInput,
-        output_model=HttpPostOutput,
-        requires_approval=True,
-    ),
-]:
-    tool_registry.register(definition)
+def _register_safe(
+    name: str,
+    description: str,
+    input_model: type,
+    output_model: type,
+) -> None:
+    tool_registry.register(
+        ToolDefinition(
+            name=name,
+            description=description,
+            category="safe",
+            permission_level=permission_level_for(name),  # type: ignore[arg-type]
+            input_model=input_model,
+            output_model=output_model,
+            requires_approval=False,
+        )
+    )
+
+
+def _register_restricted(
+    name: str,
+    description: str,
+    input_model: type,
+    output_model: type,
+) -> None:
+    tool_registry.register(
+        ToolDefinition(
+            name=name,
+            description=description,
+            category="approval_required",
+            permission_level="approval_required",
+            input_model=input_model,
+            output_model=output_model,
+            requires_approval=True,
+        )
+    )
+
+
+# Safe tools — auto-approve
+_register_safe(
+    "calculator",
+    "Deterministic arithmetic evaluation for safe numeric calculations.",
+    CalculatorInput,
+    CalculatorOutput,
+)
+_register_safe(
+    "json_transform",
+    "Deterministic JSON restructuring and extraction operations.",
+    JsonTransformInput,
+    JsonTransformOutput,
+)
+_register_safe(
+    "markdown_generator",
+    "Generate structured markdown from titles, sections, and raw content.",
+    MarkdownGeneratorInput,
+    MarkdownGeneratorOutput,
+)
+_register_safe(
+    "structured_data_extractor",
+    "Extract structured values from raw text using deterministic regex patterns.",
+    StructuredDataExtractorInput,
+    StructuredDataExtractorOutput,
+)
+_register_safe(
+    "file_reader",
+    "Read-only sandboxed file access for safe content inspection.",
+    FileReaderInput,
+    FileReaderOutput,
+)
+_register_safe(
+    "web_search",
+    "Search the web for factual information. Use for research instead of guessing.",
+    WebSearchInput,
+    WebSearchOutput,
+)
+_register_safe(
+    "webpage_fetch",
+    "Fetch and extract text from a public web page (GET only, sandboxed).",
+    WebpageFetchInput,
+    WebpageFetchOutput,
+)
+
+# Restricted tools — require human approval
+_register_restricted(
+    "shell_command",
+    "Execute an allowlisted shell command in a sandboxed environment.",
+    ShellCommandInput,
+    ShellCommandOutput,
+)
+_register_restricted(
+    "file_write",
+    "Write file content to an approved sandboxed path.",
+    FileWriteInput,
+    FileWriteOutput,
+)
+_register_restricted(
+    "file_delete",
+    "Delete a sandboxed file path after explicit approval.",
+    FileDeleteInput,
+    FileDeleteOutput,
+)
+_register_restricted(
+    "http_post",
+    "Send an HTTP POST request after explicit approval.",
+    HttpPostInput,
+    HttpPostOutput,
+)

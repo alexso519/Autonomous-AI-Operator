@@ -78,6 +78,44 @@ def build_llm(model_override: str | None = None) -> ChatOllama:
     )
 
 
+async def build_agent_routed(
+    node_data: dict[str, Any],
+    *,
+    execution_id: str,
+    node_id: str,
+    agent_name: str,
+    task_complexity: str = "moderate",
+    context_text: str = "",
+    needs_tools: bool = False,
+    is_synthesis: bool = False,
+    node_index: int = 1,
+    total_nodes: int = 1,
+    emit_fn: Any = None,
+) -> tuple[CrewAgent, str]:
+    """Build agent with adaptive model routing."""
+    from app.execution.model_router import ModelRouter, RoutingContext
+
+    routing_ctx = RoutingContext(
+        task_complexity=task_complexity,
+        context_token_estimate=ModelRouter.estimate_context_tokens(context_text),
+        needs_tools=needs_tools,
+        is_synthesis=is_synthesis,
+        is_final_output=node_index >= total_nodes,
+        agent_role=node_data.get("role", ""),
+        node_index=node_index,
+        total_nodes=total_nodes,
+    )
+    decision = await ModelRouter.select_model(
+        routing_ctx,
+        execution_id=execution_id,
+        emit_fn=emit_fn,
+        node_id=node_id,
+        agent_name=agent_name,
+    )
+    enriched = {**node_data, "model": decision.model}
+    return build_agent(enriched), decision.model
+
+
 def build_agent(node_data: dict[str, Any]) -> CrewAgent:
     """
     Convert a canvas node's data dict into a CrewAI Agent.

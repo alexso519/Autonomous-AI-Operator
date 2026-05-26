@@ -1,0 +1,39 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Chart.Name }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      app: {{ .Chart.Name }}
+  template:
+    metadata:
+      labels:
+        app: {{ .Chart.Name }}
+    spec:
+      containers:
+        - name: backend
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - containerPort: {{ .Values.service.port }}
+          env:
+            - name: ENABLE_DISTRIBUTED_RUNTIME
+              value: {{ .Values.runtime.enableDistributedRuntime | quote }}
+            - name: ENABLE_RUNTIME_MESH
+              value: {{ .Values.runtime.enableRuntimeMesh | quote }}
+            - name: ENABLE_POLICY_ENGINE
+              value: {{ .Values.runtime.enablePolicyEngine | quote }}
+            - name: ENABLE_COST_METERING
+              value: {{ .Values.runtime.enableCostMetering | quote }}
+            - name: ENABLE_INFRA_INTELLIGENCE
+              value: {{ .Values.runtime.enableInfraIntelligence | quote }}
+            - name: ENABLE_AUTOSCALING
+              value: {{ .Values.runtime.enableAutoscaling | quote }}
+            - name: COMPLIANCE_MODE
+              value: {{ .Values.runtime.complianceMode | quote }}
+            - name: DEFAULT_EXECUTION_BUDGET
+              value: {{ .Values.runtime.defaultExecutionBudget | quote }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}

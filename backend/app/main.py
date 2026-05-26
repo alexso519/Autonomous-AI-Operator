@@ -79,6 +79,50 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning("Orphan recovery failed (non-fatal): %s", e)
 
+    try:
+        from app.execution.memory_lifecycle import MemoryLifecycleManager
+
+        cleanup_stats = await MemoryLifecycleManager.rolling_cleanup()
+        if any(v for v in cleanup_stats.values() if v):
+            logger.info("Memory lifecycle cleanup: %s", cleanup_stats)
+    except Exception as e:
+        logger.warning("Memory lifecycle cleanup failed (non-fatal): %s", e)
+
+    try:
+        from app.execution.execution_stability import cleanup_orphan_executions_on_startup
+
+        stale = await cleanup_orphan_executions_on_startup()
+        if stale > 0:
+            logger.warning("Cleaned up %d stale execution(s)", stale)
+    except Exception as e:
+        logger.warning("Stale execution cleanup failed (non-fatal): %s", e)
+
+    try:
+        from app.execution.runtime_hardening import RuntimeHardening
+
+        maintenance = await RuntimeHardening.periodic_maintenance()
+        if maintenance.get("deadWorkflowsCancelled"):
+            logger.warning("Runtime hardening: %s", maintenance)
+    except Exception as e:
+        logger.warning("Runtime hardening maintenance failed (non-fatal): %s", e)
+
+    try:
+        from app.infrastructure.infrastructure_coordinator import InfrastructureCoordinator
+
+        init_result = await InfrastructureCoordinator.get_instance().initialize()
+        logger.info("Infrastructure layer initialized: %s", init_result.get("profile"))
+    except Exception as e:
+        logger.warning("Infrastructure initialization failed (non-fatal): %s", e)
+
+    # Optional startup benchmark suite (BENCHMARK_ON_STARTUP=1)
+    try:
+        from app.benchmark.benchmark_runner import run_benchmarks_on_startup
+        import asyncio
+
+        asyncio.create_task(run_benchmarks_on_startup())
+    except Exception as e:
+        logger.warning("Startup benchmark hook failed (non-fatal): %s", e)
+
     # Start orphan SSE queue sweep (automatic cleanup of abandoned queues)
     try:
         await event_manager.start_orphan_sweep()
@@ -109,7 +153,23 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.error("Error cleaning up SSE queues: %s", e)
 
+    # Clean up sandbox workspaces
+    try:
+        from app.execution.sandbox_manager import SandboxManager
+        cleaned = SandboxManager.cleanup_all()
+        if cleaned:
+            logger.info("Cleaned up %d sandbox workspace(s)", cleaned)
+    except Exception as e:
+        logger.warning("Sandbox cleanup failed (non-fatal): %s", e)
+
     # Close database
+    try:
+        from app.infrastructure.infrastructure_coordinator import InfrastructureCoordinator
+
+        await InfrastructureCoordinator.get_instance().shutdown()
+    except Exception as e:
+        logger.warning("Infrastructure shutdown failed (non-fatal): %s", e)
+
     try:
         await close_db()
     except Exception as e:

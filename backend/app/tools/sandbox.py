@@ -2,6 +2,7 @@ import asyncio
 from typing import Any
 
 from app.tools.permissions import validate_tool_request
+from app.tools.tool_safety import requires_manual_approval
 from app.tools.tool_models import (
     ToolBaseInput,
     ToolDefinition,
@@ -18,6 +19,8 @@ from app.tools.builtin import (
     write_file,
     delete_file,
     execute_http_post,
+    execute_web_search,
+    execute_webpage_fetch,
 )
 
 
@@ -32,6 +35,8 @@ def _executor_for_tool(name: str):
         "file_write": write_file,
         "file_delete": delete_file,
         "http_post": execute_http_post,
+        "web_search": execute_web_search,
+        "webpage_fetch": execute_webpage_fetch,
     }.get(name)
 
 
@@ -40,7 +45,7 @@ async def execute_tool(
     input_obj: ToolBaseInput,
     approved: bool = False,
 ) -> dict[str, Any]:
-    if definition.requires_approval and not approved:
+    if requires_manual_approval(definition.name) and not approved:
         raise ToolApprovalRequired(
             tool_name=definition.name,
             reason=f"Approval required for tool '{definition.name}'.",

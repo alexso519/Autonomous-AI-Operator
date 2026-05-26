@@ -1,0 +1,21 @@
+You are building an Autonomous AI Operating System.
+
+Architecture constraints:
+- Keep FastAPI backend
+- Keep Next.js frontend
+- Keep CrewAI
+- Keep Ollama
+- Keep SQLite
+- Keep Docker Compose
+
+Important:
+- Do NOT rewrite execution engine
+- Prefer incremental refactors
+- Keep architecture deterministic
+- Keep runtime inspectable
+- Keep tools sandboxed
+- Avoid enterprise complexity
+- Single-user local-first only
+
+Current UX goal:
+Chat-first autonomous operator experience.

@@ -6,7 +6,7 @@ Runtime safety layer:
   ExecutionManager  — Centralized task registry, cancellation, thread mgmt
   ExecutionLock     — Per-execution mutual exclusion guard
 
-Engine exports:
+Engine exports (lazy-loaded to avoid heavy CrewAI imports at package init):
   execute_workflow()     — Run a workflow sequentially through all agent nodes
   resume_workflow()      — Resume execution after approval gate
   reject_execution()     — Reject a paused execution
@@ -20,19 +20,17 @@ Runtime safety exports:
   recover_orphaned_executions — Startup crash recovery
 """
 
-from app.execution.engine import (
-    execute_workflow,
-    resume_workflow,
-    reject_execution,
-)
-from app.execution.agent_factory import build_agent
+from __future__ import annotations
+
+from typing import Any
+
 from app.execution.context_manager import ContextManager
 from app.execution.manager import (
-    execution_manager,
-    ExecutionManager,
     ExecutionLock,
+    ExecutionManager,
     ExecutionStatus,
     RegisteredTask,
+    execution_manager,
     recover_orphaned_executions,
 )
 from app.execution.runtime_state import (
@@ -43,8 +41,36 @@ from app.execution.runtime_state import (
     transition_execution_state,
 )
 
+_LAZY_EXPORTS = {
+    "execute_workflow",
+    "resume_workflow",
+    "reject_execution",
+    "build_agent",
+}
+
+
+def __getattr__(name: str) -> Any:
+    if name in ("execute_workflow", "resume_workflow", "reject_execution"):
+        from app.execution.engine import (
+            execute_workflow,
+            reject_execution,
+            resume_workflow,
+        )
+
+        return {
+            "execute_workflow": execute_workflow,
+            "resume_workflow": resume_workflow,
+            "reject_execution": reject_execution,
+        }[name]
+    if name == "build_agent":
+        from app.execution.agent_factory import build_agent
+
+        return build_agent
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
 __all__ = [
-    # Engine
+    # Engine (lazy)
     "execute_workflow",
     "resume_workflow",
     "reject_execution",

@@ -51,21 +51,50 @@ from typing import Any
 from crewai import Task as CrewTask
 
 from app.database.database import get_db
-from app.execution.agent_factory import build_agent
+from app.execution.agent_factory import build_agent, build_agent_routed
+from app.execution.production_safety import ProductionSafetyGuard
+from app.execution.execution_analytics import ExecutionAnalytics
+from app.execution.memory_lifecycle import MemoryLifecycleManager
 from app.execution.context_manager import ContextManager
+from app.execution.final_synthesizer import FinalResponseSynthesizer
 from app.execution.manager import execution_manager
-from app.execution.reflection_service import ReflectionService, ReplanningService
-from app.execution.runtime_state import (
-    RuntimeState,
-    init_execution_state,
-    transition_execution_state,
+from app.execution.execution_stability import ExecutionStabilityMonitor
+from app.execution.runtime_performance import RuntimePerformanceTracker
+from app.execution.runtime_hardening import RuntimeHardening
+from app.execution.adaptive_graph import AdaptiveExecutionGraph
+from app.execution.confidence_engine import ConfidenceEngine
+from app.execution.dynamic_planner import DynamicPlanner
+from app.execution.hierarchical_memory import HierarchicalMemory
+from app.execution.memory_runtime import MemoryRuntime
+from app.execution.parallel_runtime import ParallelRuntime
+from app.execution.research_agents import is_research_objective
+from app.execution.tool_planning import ToolPlanner
+from app.tools.tool_orchestrator import ToolOrchestrator
+from app.execution.execution_runtime import ExecutionRuntime
+from app.execution.runtime_lifecycle import ExecutionPhase, LifecycleManager
+from app.execution.runtime_state import RuntimeState
+from app.tools.tool_invocation import (
+    MAX_TOOL_INVOCATIONS,
+    ToolInvocationOutcome,
+    execute_tool_request_if_present,
 )
+from app.tools.tool_models import ToolCallRequest
+from app.tools.tool_registry import tool_registry
+from app.tools.tool_safety import is_auto_approved, requires_manual_approval
 from app.streaming.event_manager import event_manager, StreamEvent
+from app.runtime.execution_kernel import ExecutionKernel
+from app.runtime.action_system import (
+    ActionContext,
+    ActionPriority,
+    ActionType,
+    RuntimeAction,
+)
 
 logger = logging.getLogger(__name__)
 
-# Default per-agent timeout (seconds)
-_DEFAULT_AGENT_TIMEOUT = 300  # 5 minutes
+# Default per-agent timeout (seconds).
+# qwen2.5:3b on CPU with large accumulated context can take 8-10 min per step.
+_DEFAULT_AGENT_TIMEOUT = 600  # 10 minutes
 
 
 # ── Helpers ───────────────────────────────────────────────────────
@@ -89,7 +118,42 @@ def _is_approval_node(node: dict[str, Any]) -> bool:
     return node_type == "approval"
 
 
-def _resolve_prompt(node_data: dict[str, Any], context: str) -> str:
+def _format_tool_descriptions() -> str:
+    """Return a short list of available tools for the prompt."""
+    lines: list[str] = ["Available tools:"]
+    for tool in tool_registry.list():
+        if is_auto_approved(tool.name):
+            policy = "auto-approve"
+        elif requires_manual_approval(tool.name):
+            policy = "requires approval"
+        else:
+            policy = tool.permission_level
+        lines.append(f"- {tool.name}: {tool.description} [{policy}]")
+    return "\n".join(lines)
+
+
+def _tool_usage_instructions() -> str:
+    return (
+        "IMPORTANT: For factual research, current events, or external data you MUST use tools "
+        "instead of guessing or hallucinating.\n"
+        "Preferred research flow:\n"
+        "  1. web_search with your query to find sources\n"
+        "  2. webpage_fetch on relevant URLs to read content\n"
+        "  3. structured_data_extractor or markdown_generator to format findings\n\n"
+        "To invoke a tool, respond with ONLY a single JSON object:\n"
+        '{"tool_name": "<tool_name>", "input_data": { ... }}\n'
+        "Do not include markdown or explanation with the tool request.\n"
+        "After the tool runs, its output appears in shared context — continue reasoning from that data.\n"
+        "Safe tools (calculator, web_search, webpage_fetch, file_reader, etc.) run immediately.\n"
+        "Restricted tools (shell_command, file_write, file_delete, http_post) pause for approval.\n"
+    )
+
+
+def _resolve_prompt(
+    node_data: dict[str, Any],
+    context: str,
+    tool_plan_block: str = "",
+) -> str:
     """Build the task prompt for an agent node."""
     goal = node_data.get("goal", "Complete the assigned task.")
     label = node_data.get("label", "Agent")
@@ -99,17 +163,123 @@ def _resolve_prompt(node_data: dict[str, Any], context: str) -> str:
     if context.strip():
         parts.extend(["", "--- Context from previous agents ---", context])
 
+    if tool_plan_block.strip():
+        parts.extend(["", tool_plan_block])
+
     parts.extend([
         "",
         "--- Instructions ---",
-        "Please complete your goal using the context provided above.",
-        "Provide a thorough, well-structured response.",
+        "Complete your goal using the context provided above.",
+        "Be concise and structured — avoid repetition and filler.",
+        "Use tools for factual claims instead of guessing.",
+        "",
+        "--- Tool Guidance ---",
+        _tool_usage_instructions(),
+        "",
+        _format_tool_descriptions(),
     ])
 
     return "\n".join(parts)
 
 
-# ── Streaming event helpers ───────────────────────────────────────
+def _format_tool_request_summary(request: ToolCallRequest) -> str:
+    return (
+        f"Tool request: {request.tool_name} with input {json.dumps(request.input_data, ensure_ascii=False)}"
+    )
+
+
+async def _maybe_execute_agent_tool_call(
+    execution_id: str,
+    node_id: str,
+    agent_name: str,
+    output_text: str,
+    ctx: ContextManager,
+) -> ToolInvocationOutcome | None:
+    outcome = await execute_tool_request_if_present(
+        execution_id=execution_id,
+        node_id=node_id,
+        agent_name=agent_name,
+        raw_text=output_text,
+        ctx=ctx,
+    )
+
+    if outcome is None:
+        return None
+
+    request = outcome.request
+    response = outcome.response
+
+    await _emit(
+        execution_id,
+        "tool_requested",
+        agent_name,
+        _format_tool_request_summary(request),
+        toolName=request.tool_name,
+        nodeId=node_id,
+    )
+
+    if response.status == "completed":
+        await _emit(
+            execution_id,
+            "tool_completed",
+            agent_name,
+            f"Tool {response.tool_name} completed successfully.",
+            toolName=response.tool_name,
+            toolOutput=response.output,
+        )
+        # Frontend-compatible aliases
+        await _emit(
+            execution_id,
+            "tool_invoked",
+            agent_name,
+            f"Invoked {response.tool_name}",
+            toolName=response.tool_name,
+            input=request.input_data,
+            data={
+                "tool_name": response.tool_name,
+                "input": request.input_data,
+                "invocation_id": f"{node_id}-{response.tool_name}",
+            },
+        )
+        await _emit(
+            execution_id,
+            "tool_result",
+            agent_name,
+            f"Tool {response.tool_name} result ready",
+            toolName=response.tool_name,
+            toolOutput=response.output,
+            data={
+                "tool_name": response.tool_name,
+                "output": response.output,
+                "status": "completed",
+                "invocation_id": f"{node_id}-{response.tool_name}",
+            },
+        )
+        return outcome
+
+    if response.status == "pending_approval":
+        await _emit(
+            execution_id,
+            "tool_approval_requested",
+            agent_name,
+            f"Tool {response.tool_name} requires approval before execution.",
+            toolName=response.tool_name,
+            toolError=response.error,
+        )
+        return outcome
+
+    await _emit(
+        execution_id,
+        "tool_failed",
+        agent_name,
+        f"Tool {response.tool_name} failed: {response.error}",
+        toolName=response.tool_name,
+        toolError=response.error,
+    )
+    return outcome
+
+
+# ── Streaming event helpers ───────────────────────────────────────────
 
 
 async def _emit(
@@ -119,44 +289,25 @@ async def _emit(
     message: str,
     **data: Any,
 ) -> None:
-    """Emit a typed event to the execution's stream AND persist it."""
-    # Check cancellation before emitting (saves unnecessary DB writes)
-    if execution_manager.is_cancellation_requested(execution_id):
+    """Emit a typed event via the unified RuntimeEventBus."""
+    runtime = ExecutionRuntime.get(execution_id)
+    if runtime is not None:
+        await runtime.emit(event_type, agent, message, **data)
         return
 
-    event = StreamEvent(
-        type=event_type,
-        agent=agent,
-        message=message,
-        data=data,
-    )
+    # Fallback for executions without a bound runtime (e.g. resume edge cases)
+    if execution_manager.is_cancellation_requested(execution_id):
+        return
+    event = StreamEvent(type=event_type, agent=agent, message=message, data=data)
     await event_manager.emit(execution_id, event)
-
-    # Persist event to execution_event_logs
-    try:
-        db = await get_db()
-        await db.execute(
-            """INSERT INTO execution_event_logs
-               (execution_id, event_type, timestamp, agent, message, data)
-               VALUES (?, ?, ?, ?, ?, ?)""",
-            (
-                execution_id,
-                event_type,
-                event.timestamp,
-                agent,
-                message[:1000],
-                json.dumps(data),
-            ),
-        )
-        await db.commit()
-    except Exception:
-        logger.exception(
-            "Failed to persist event for execution %s", execution_id
-        )
 
 
 async def _end_stream(execution_id: str) -> None:
     """Send sentinel to end the SSE stream."""
+    runtime = ExecutionRuntime.get(execution_id)
+    if runtime is not None:
+        await runtime.end_stream()
+        return
     if not execution_manager.is_cancellation_requested(execution_id):
         await event_manager.emit(execution_id, None)
 
@@ -167,22 +318,28 @@ async def _record_runtime_state(
     reason: str | None = None,
     metadata: dict[str, Any] | None = None,
     from_state: RuntimeState | str | None = None,
+    phase: ExecutionPhase | None = None,
 ) -> None:
-    """Persist a runtime state transition without breaking execution."""
-    try:
-        await _record_runtime_state(
-            execution_id=execution_id,
+    """Persist a runtime state transition via LifecycleManager."""
+    runtime = ExecutionRuntime.get(execution_id)
+    if runtime is not None:
+        await runtime.lifecycle.transition(
             to_state=to_state,
             reason=reason,
             metadata=metadata,
             from_state=from_state,
+            phase=phase,
         )
-    except Exception as exc:
-        logger.warning(
-            "Could not persist runtime state transition for %s: %s",
-            execution_id,
-            exc,
-        )
+        return
+
+    lifecycle = LifecycleManager(execution_id)
+    await lifecycle.transition(
+        to_state=to_state,
+        reason=reason,
+        metadata=metadata,
+        from_state=from_state,
+        phase=phase,
+    )
 
 
 # ── Cancellation check ───────────────────────────────────────────
@@ -496,15 +653,6 @@ async def _execute_agent_step(
     }
     logs.append(log_entry)
 
-    await _emit(
-        execution_id,
-        "log",
-        "system",
-        f"[{idx}/{agent_count}] Activating {agent_name}...",
-        logId=log_entry["id"],
-        level="info",
-    )
-
     log_entry2 = {
         "id": uuid.uuid4().hex[:12],
         "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -524,16 +672,79 @@ async def _execute_agent_step(
     )
 
     try:
-        # Build agent from node data
-        agent = build_agent(node_data)
+        # Production safety: duration + retry circuit
+        safety = ProductionSafetyGuard.mid_execution_check(execution_id)
+        if not safety.allowed:
+            return "failed", safety.reason
 
-        # Build task with context
-        combined_context = ctx.get_combined_context()
-        prompt = _resolve_prompt(node_data, combined_context)
+        # Build task with role-based context budget
+        task_complexity = str(
+            ctx.get_workflow_memory("task_complexity") or "moderate"
+        )
+        is_synthesis = (
+            "synthes" in agent_name.lower()
+            or "synthes" in node_data.get("role", "").lower()
+        )
+        is_retry = bool(
+            node_data.get("executionMetadata", {}).get("recovery")
+            or agent_name.lower().startswith("retry ")
+        )
+        model_tier = (
+            "synthesis" if is_synthesis
+            else "retry" if is_retry
+            else "lightweight" if task_complexity in ("simple", "low")
+            else "reasoning" if task_complexity in ("complex", "high")
+            else "standard"
+        )
+
+        tool_plan = ToolPlanner.infer_tools_for_node(node)
+        ToolPlanner.persist_plan(ctx, tool_plan)
+        tool_plan_block = ToolPlanner.build_tool_context_block(tool_plan)
+        if ConfidenceEngine.should_force_tool_grounding(ctx):
+            tool_plan_block += (
+                "\n\nLOW CONFIDENCE: Use web_search and webpage_fetch to ground "
+                "factual claims before concluding.\n"
+            )
+            ctx.set_workflow_memory("pending_confidence_action", None)
+
+        memory_runtime = MemoryRuntime.for_execution(execution_id, ctx)
+        assembly = await memory_runtime.assemble_context(
+            model_tier=model_tier,
+            is_synthesis=is_synthesis,
+            is_retry=is_retry,
+            agent_name=agent_name,
+            agent_role=node_data.get("role", ""),
+            emit_fn=_emit,
+        )
+        combined_context = assembly.context
+        budget_meta = assembly.metadata
+        await _emit(
+            execution_id,
+            "context_budget",
+            agent_name,
+            f"Context budget: ~{budget_meta.get('estimatedTokens', 0)} tokens",
+            nodeId=node_id,
+            **{k: v for k, v in budget_meta.items() if isinstance(v, (str, int, float, bool, list))},
+        )
+
+        agent, _selected_model = await build_agent_routed(
+            node_data,
+            execution_id=execution_id,
+            node_id=node_id,
+            agent_name=agent_name,
+            task_complexity=task_complexity,
+            context_text=combined_context,
+            needs_tools=bool(tool_plan.recommended_tools),
+            is_synthesis=is_synthesis,
+            node_index=idx,
+            total_nodes=agent_count,
+            emit_fn=_emit,
+        )
+        prompt = _resolve_prompt(node_data, combined_context, tool_plan_block)
 
         task = CrewTask(
             description=prompt,
-            expected_output="A detailed response addressing the goal.",
+            expected_output="A concise, well-structured response addressing the goal.",
             agent=agent,
         )
 
@@ -544,34 +755,115 @@ async def _execute_agent_step(
             agent_name,
             f"⏳ {agent_name} is thinking...",
             nodeId=node_id,
+            plannedTools=tool_plan.recommended_tools,
         )
 
-        log_entry3 = {
-            "id": uuid.uuid4().hex[:12],
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "level": "info",
-            "agentName": "system",
-            "content": f"⏳ {agent_name} is thinking...",
-        }
-        logs.append(log_entry3)
+        await RuntimeHardening.emit_memory_warning(execution_id, _emit)
+        RuntimePerformanceTracker.begin_stage(execution_id, "agent", agent_name)
 
-        await _emit(
-            execution_id,
-            "log",
-            "system",
-            f"⏳ {agent_name} is thinking...",
-            logId=log_entry3["id"],
-            level="info",
-        )
-
-        # Execute agent with timeout and cancellation support
-        # Uses ExecutionManager's thread pool for cancellable execution
-        output_text = await _run_agent_with_timeout(
+        # Heartbeat monitor for long-running local LLM agents
+        await ExecutionStabilityMonitor.start_agent_monitor(
             execution_id=execution_id,
-            agent=agent,
-            task=task,
-            timeout=agent_timeout,
+            node_id=node_id,
+            agent_name=agent_name,
+            emit_fn=_emit,
+            cancel_check=execution_manager.is_cancellation_requested,
         )
+
+        try:
+            output_text = await _run_agent_with_timeout(
+                execution_id=execution_id,
+                agent=agent,
+                task=task,
+                timeout=agent_timeout,
+            )
+        finally:
+            await ExecutionStabilityMonitor.stop_agent_monitor(execution_id)
+
+        RuntimePerformanceTracker.end_stage(execution_id, "agent", agent_name)
+
+        # Allow the agent to request structured tool invocations and continue.
+        for attempt in range(MAX_TOOL_INVOCATIONS):
+            outcome = await _maybe_execute_agent_tool_call(
+                execution_id=execution_id,
+                node_id=node_id,
+                agent_name=agent_name,
+                output_text=output_text,
+                ctx=ctx,
+            )
+
+            if outcome is None:
+                break
+
+            if outcome.response.status == "completed":
+                ctx.set_workflow_memory(
+                    "last_tool_result",
+                    {
+                        "tool_name": outcome.response.tool_name,
+                        "output": outcome.response.output,
+                    },
+                )
+                await ctx.persist()
+
+                memory_runtime = MemoryRuntime.for_execution(execution_id, ctx)
+                assembly = await memory_runtime.assemble_context(
+                    model_tier=model_tier,
+                    is_synthesis=is_synthesis,
+                    is_retry=is_retry,
+                    agent_name=agent_name,
+                    agent_role=node_data.get("role", ""),
+                    emit_fn=_emit,
+                )
+                combined_context = assembly.context
+                prompt = _resolve_prompt(node_data, combined_context, tool_plan_block)
+                task = CrewTask(
+                    description=prompt,
+                    expected_output="A concise, well-structured response addressing the goal.",
+                    agent=agent,
+                )
+                await ExecutionStabilityMonitor.start_agent_monitor(
+                    execution_id=execution_id,
+                    node_id=node_id,
+                    agent_name=agent_name,
+                    emit_fn=_emit,
+                    cancel_check=execution_manager.is_cancellation_requested,
+                )
+                try:
+                    output_text = await _run_agent_with_timeout(
+                        execution_id=execution_id,
+                        agent=agent,
+                        task=task,
+                        timeout=agent_timeout,
+                    )
+                finally:
+                    await ExecutionStabilityMonitor.stop_agent_monitor(execution_id)
+                continue
+
+            if outcome.response.status == "pending_approval":
+                failed_now = datetime.now(timezone.utc).isoformat()
+                await db.execute(
+                    """UPDATE execution_steps
+                       SET status = 'failed', output = ?, completed_at = ?
+                       WHERE id = ?""",
+                    (
+                        f"Tool approval required for {outcome.response.tool_name}",
+                        failed_now,
+                        step_id,
+                    ),
+                )
+                await db.commit()
+                return "failed", outcome.response.error or "Tool approval required"
+
+            if outcome.response.status == "failed":
+                failed_now = datetime.now(timezone.utc).isoformat()
+                await db.execute(
+                    """UPDATE execution_steps
+                       SET status = 'failed', output = ?, completed_at = ?
+                       WHERE id = ?""",
+                    (outcome.response.error or "Tool failed", failed_now, step_id),
+                )
+                await db.commit()
+                return "failed", outcome.response.error or "Tool failed"
 
         completed_now = datetime.now(timezone.utc).isoformat()
         ctx.add_output(node_id, agent_name, output_text)
@@ -600,7 +892,7 @@ async def _execute_agent_step(
         )
         await db.commit()
 
-        # Emit: output
+        # Emit: output (single event — no duplicate log stream)
         await _emit(
             execution_id,
             "output",
@@ -611,23 +903,13 @@ async def _execute_agent_step(
             truncated=len(output_text) > 500,
         )
 
-        log_entry4 = {
+        logs.append({
             "id": uuid.uuid4().hex[:12],
             "timestamp": completed_now,
             "level": "output",
             "agentName": agent_name,
             "content": output_text[:500],
-        }
-        logs.append(log_entry4)
-
-        await _emit(
-            execution_id,
-            "log",
-            agent_name,
-            output_text[:500],
-            logId=log_entry4["id"],
-            level="output",
-        )
+        })
 
         # Emit: agent_completed
         await _emit(
@@ -784,6 +1066,41 @@ async def _run_agent_with_timeout(
         ) from None
 
 
+async def _emit_confidence(
+    execution_id: str,
+    node: dict[str, Any],
+    ctx: ContextManager,
+) -> None:
+    assessment = ConfidenceEngine.assess(node, ctx)
+    await _emit(
+        execution_id,
+        "confidence_updated",
+        assessment.agent_name,
+        f"Confidence {assessment.score:.0%}: {assessment.reasoning}",
+        nodeId=assessment.node_id,
+        confidenceScore=assessment.score,
+        triggers=assessment.triggers,
+        recommendedAction=assessment.recommended_action.value,
+        factuality=assessment.factuality,
+        completion=assessment.completion,
+    )
+    memory = HierarchicalMemory(ctx)
+    memory.record_execution(
+        assessment.node_id,
+        assessment.agent_name,
+        ctx.get_all_outputs().get(assessment.node_id, ""),
+        confidence=assessment.score,
+    )
+    output = ctx.get_all_outputs().get(assessment.node_id, "")
+    if output:
+        memory.summarize_to_long_term(assessment.agent_name, output)
+    memory.sync_from_context()
+    # Sync through unified coordinator when runtime is active
+    mem_rt = MemoryRuntime.get(execution_id)
+    if mem_rt:
+        mem_rt.coordinator.sync_hierarchical()
+
+
 async def _run_reflection_and_replanning(
     execution_id: str,
     node: dict[str, Any],
@@ -792,54 +1109,358 @@ async def _run_reflection_and_replanning(
     edges: list[dict[str, Any]],
     ctx: ContextManager,
     logs: list[dict[str, Any]],
+    graph: AdaptiveExecutionGraph | None = None,
 ) -> list[dict[str, Any]]:
-    """Evaluate output quality and insert recovery steps when needed."""
-    finding = ReflectionService.inspect_output(node, ctx)
-    if not finding.should_replan:
-        if finding.action == "max_retries_reached":
-            await _emit(
-                execution_id,
-                "reflection_limit_reached",
-                "system",
-                f"Reflection limit reached for {finding.agent_name}: {finding.reason}",
-                nodeId=finding.node_id,
-                issues=finding.issues,
-            )
+    """Evaluate output quality via ReflectionCoordinator and replan if needed."""
+    kernel = ExecutionKernel.get(execution_id)
+    if kernel is not None and graph is not None:
+        kernel.set_dispatcher_extra(
+            graph=graph,
+            sorted_nodes=sorted_nodes,
+            edges=edges,
+            logs=logs,
+        )
+        action = RuntimeAction(
+            action_type=ActionType.REFLECTION,
+            context=ActionContext(
+                execution_id=execution_id,
+                node_id=node.get("id", ""),
+                agent_name=node.get("data", {}).get("label", "agent"),
+            ),
+            payload={"node": node, "idx": idx},
+            priority=ActionPriority.NORMAL,
+        )
+        result = await kernel.dispatch_action(action)
+        if result.success and result.output is not None:
+            return result.output
         return sorted_nodes
 
-    sorted_nodes = ReplanningService.insert_recovery_steps(
+    runtime = ExecutionRuntime.get(execution_id)
+    if runtime is None:
+        runtime = ExecutionRuntime(execution_id, ctx)
+    else:
+        runtime.bind_context(ctx)
+
+    runtime.telemetry.record_reflection()
+    result = await runtime.reflection.evaluate_and_emit(
+        node=node,
+        emit_fn=_emit,
+        graph=graph,
+        idx=idx,
         sorted_nodes=sorted_nodes,
         edges=edges,
-        node_index=idx - 1,
+        logs=logs,
+    )
+    return result if result is not None else sorted_nodes
+
+
+async def _process_completed_node(
+    execution_id: str,
+    node: dict[str, Any],
+    idx: int,
+    sorted_nodes: list[dict[str, Any]],
+    edges: list[dict[str, Any]],
+    graph: AdaptiveExecutionGraph,
+    ctx: ContextManager,
+    logs: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Post-step: confidence, reflection, dynamic subgoals."""
+    graph.mark_completed(node.get("id", ""))
+    await _emit_confidence(execution_id, node, ctx)
+    output = ctx.get_all_outputs().get(node.get("id", ""), "")
+    spawned = await DynamicPlanner.maybe_spawn_subgoal_agents(
+        execution_id, graph, node, output, ctx, _emit
+    )
+    if spawned:
+        sorted_nodes = graph.ordered_nodes()
+    sorted_nodes = await _run_reflection_and_replanning(
+        execution_id=execution_id,
         node=node,
-        finding=finding,
+        idx=idx,
+        sorted_nodes=sorted_nodes,
+        edges=edges,
         ctx=ctx,
+        logs=logs,
+        graph=graph,
     )
-    await ctx.persist()
-
-    message = (
-        f"Reflection detected weak output for {finding.agent_name}. "
-        f"Injected recovery workflow steps: {finding.action}."
-    )
-    await _emit(
-        execution_id,
-        "reflection_action",
-        "system",
-        message,
-        nodeId=finding.node_id,
-        issues=finding.issues,
-        action=finding.action,
-        retryCount=finding.retry_count + 1,
-    )
-
-    logs.append({
-        "id": uuid.uuid4().hex[:12],
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-        "level": "warning",
-        "agentName": "system",
-        "content": message,
-    })
     return sorted_nodes
+
+
+async def _execute_nodes_adaptive(
+    execution_id: str,
+    workflow_id: str,
+    workflow_name: str,
+    workflow_description: str,
+    sorted_nodes: list[dict[str, Any]],
+    edges: list[dict[str, Any]],
+    ctx: ContextManager,
+    logs: list[dict[str, Any]],
+    steps: list[dict[str, Any]],
+    agent_timeout: int,
+    start_after_idx: int = 0,
+) -> tuple[str, str | None, list[dict[str, Any]]]:
+    """
+    Adaptive DAG scheduler with parallel batches and runtime replanning.
+
+    Returns (final_status, final_error, updated_sorted_nodes).
+    """
+    graph, _strategy = await DynamicPlanner.initialize_execution(
+        execution_id=execution_id,
+        objective=workflow_description,
+        nodes=sorted_nodes,
+        edges=edges,
+        ctx=ctx,
+        emit_fn=_emit,
+        resume=start_after_idx > 0,
+    )
+
+    if start_after_idx == 0 and workflow_description.strip():
+        try:
+            from app.cognition.cognitive_orchestrator import CognitiveOrchestrator
+
+            await CognitiveOrchestrator.run_pre_execution(
+                execution_id=execution_id,
+                objective=workflow_description,
+                ctx=ctx,
+                emit_fn=_emit,
+            )
+            await ctx.persist()
+        except Exception as exc:
+            logger.warning("Cognitive pre-execution failed for %s: %s", execution_id, exc)
+
+    if start_after_idx == 0:
+        from app.execution.coding_agents import (
+            is_coding_objective,
+            is_browser_objective,
+            is_computer_use_pipeline_objective,
+        )
+        from app.computer_use.computer_use_agents import is_computer_workflow_objective
+
+        kernel = ExecutionKernel.get(execution_id)
+        if kernel is not None:
+            kernel.set_dispatcher_extra(
+                graph=graph,
+                sorted_nodes=sorted_nodes,
+                edges=edges,
+                logs=logs,
+            )
+            try:
+                await kernel.schedule_pipeline_actions(
+                    workflow_description,
+                    include_coding=is_coding_objective(workflow_description),
+                    include_browser=is_browser_objective(workflow_description)
+                    and not is_computer_use_pipeline_objective(workflow_description),
+                    include_computer_use=is_computer_use_pipeline_objective(workflow_description)
+                    and not is_computer_workflow_objective(workflow_description),
+                    include_computer_workflow=is_computer_workflow_objective(workflow_description),
+                    include_research=is_research_objective(workflow_description),
+                )
+                await kernel.run_scheduled_pipelines()
+            except Exception as exc:
+                logger.warning(
+                    "Kernel pipeline dispatch failed for %s: %s",
+                    execution_id,
+                    exc,
+                )
+        else:
+            from app.coding.coding_orchestrator import CodingOrchestrator
+            from app.browser.browser_orchestrator import BrowserOrchestrator
+            from app.computer_use.computer_use_orchestrator import ComputerUseOrchestrator
+
+            if is_computer_use_pipeline_objective(workflow_description):
+                if not ctx.get_workflow_memory("computer_use_pipeline_completed"):
+                    try:
+                        await ComputerUseOrchestrator.execute_computer_use_pipeline(
+                            execution_id=execution_id,
+                            objective=workflow_description,
+                            ctx=ctx,
+                            emit_fn=_emit,
+                        )
+                        ctx.set_workflow_memory("computer_use_pipeline_completed", True)
+                        await ctx.persist()
+                    except Exception as exc:
+                        logger.warning(
+                            "Computer use pipeline failed for %s: %s",
+                            execution_id,
+                            exc,
+                        )
+
+            if is_coding_objective(workflow_description):
+                if not ctx.get_workflow_memory("coding_pipeline_completed"):
+                    try:
+                        await CodingOrchestrator.execute_coding_pipeline(
+                            execution_id=execution_id,
+                            objective=workflow_description,
+                            ctx=ctx,
+                            emit_fn=_emit,
+                        )
+                        ctx.set_workflow_memory("coding_pipeline_completed", True)
+                        await ctx.persist()
+                    except Exception as exc:
+                        logger.warning(
+                            "Autonomous coding pipeline failed for %s: %s",
+                            execution_id,
+                            exc,
+                        )
+
+            if is_browser_objective(workflow_description):
+                if not ctx.get_workflow_memory("browser_pipeline_completed"):
+                    if not ctx.get_workflow_memory("computer_use_pipeline_completed"):
+                        try:
+                            await BrowserOrchestrator.execute_browser_pipeline(
+                                execution_id=execution_id,
+                                objective=workflow_description,
+                                ctx=ctx,
+                                emit_fn=_emit,
+                            )
+                            ctx.set_workflow_memory("browser_pipeline_completed", True)
+                            await ctx.persist()
+                        except Exception as exc:
+                            logger.warning(
+                                "Browser automation pipeline failed for %s: %s",
+                                execution_id,
+                                exc,
+                            )
+
+            if is_research_objective(workflow_description):
+                if not ctx.get_workflow_memory("research_pipeline_completed"):
+                    try:
+                        await ToolOrchestrator.execute_research_pipeline(
+                            execution_id=execution_id,
+                            query=workflow_description,
+                            ctx=ctx,
+                            emit_fn=_emit,
+                        )
+                        ctx.set_workflow_memory("research_pipeline_completed", True)
+                        await ctx.persist()
+                    except Exception as exc:
+                        logger.warning(
+                            "Autonomous research pipeline failed for %s: %s",
+                            execution_id,
+                            exc,
+                        )
+
+    step_lock = asyncio.Lock()
+    sorted_nodes = graph.ordered_nodes()
+    agent_count = len(sorted_nodes)
+    final_status = "completed"
+    final_error: str | None = None
+    processed: set[str] = set()
+
+    if start_after_idx > 0:
+        for i, node in enumerate(sorted_nodes):
+            if i < start_after_idx:
+                nid = node.get("id", "")
+                if nid:
+                    graph.mark_completed(nid)
+                    processed.add(nid)
+
+    while True:
+        safety = ProductionSafetyGuard.mid_execution_check(execution_id)
+        if not safety.allowed:
+            return "failed", safety.reason, graph.ordered_nodes()
+
+        ready = graph.get_ready_nodes()
+        ready = [n for n in ready if n.get("id") not in processed]
+        if not ready:
+            break
+
+        approval_in_batch = [n for n in ready if _is_approval_node(n)]
+        if approval_in_batch:
+            node = approval_in_batch[0]
+            idx = len(processed) + 1
+            await _handle_approval_node(
+                execution_id=execution_id,
+                node=node,
+                idx=idx,
+                sorted_nodes=sorted_nodes,
+                ctx=ctx,
+                workflow_id=workflow_id,
+                workflow_name=workflow_name,
+                workflow_description=workflow_description,
+                logs=logs,
+                steps=steps,
+                edges=edges,
+                agent_count=agent_count,
+            )
+            await _end_stream(execution_id)
+            return "waiting_approval", None, sorted_nodes
+
+        agent_ready = [n for n in ready if not _is_approval_node(n)]
+        if not agent_ready:
+            break
+
+        batch_results = await ParallelRuntime.execute_ready_batch(
+            execution_id=execution_id,
+            graph=graph,
+            ready_nodes=agent_ready,
+            agent_count=agent_count,
+            ctx=ctx,
+            logs=logs,
+            steps=steps,
+            execute_step=_execute_agent_step,
+            emit_fn=_emit,
+            agent_timeout=agent_timeout,
+            check_cancelled=_check_cancelled,
+            step_lock=step_lock,
+        )
+
+        for node, status, error in batch_results:
+            node_id = node.get("id", "")
+            processed.add(node_id)
+            idx = len(processed)
+
+            if status == "cancelled":
+                final_status = "cancelled"
+                return final_status, final_error, graph.ordered_nodes()
+            if status == "failed":
+                final_status = "failed"
+                final_error = error
+                graph.mark_failed(node_id)
+                return final_status, final_error, graph.ordered_nodes()
+
+            sorted_nodes = await _process_completed_node(
+                execution_id=execution_id,
+                node=node,
+                idx=idx,
+                sorted_nodes=sorted_nodes,
+                edges=edges,
+                graph=graph,
+                ctx=ctx,
+                logs=logs,
+            )
+            sorted_nodes = graph.ordered_nodes()
+            agent_count = len(sorted_nodes)
+
+            await ExecutionStabilityMonitor.save_checkpoint_snapshot(
+                execution_id=execution_id,
+                ctx_state=ctx.get_state(),
+                sorted_nodes=sorted_nodes,
+                current_idx=idx,
+                steps=steps,
+                logs=logs,
+                edges=edges,
+                workflow_meta={
+                    "workflowId": workflow_id,
+                    "workflowName": workflow_name,
+                },
+            )
+
+            kernel = ExecutionKernel.get(execution_id)
+            if kernel is not None:
+                await kernel.checkpoint(
+                    "running",
+                    graph_state={
+                        "processed": list(processed),
+                        "nodeCount": agent_count,
+                    },
+                    reason="node_completed",
+                )
+
+        if final_status != "completed":
+            break
+
+    return final_status, final_error, sorted_nodes
 
 
 # ── Core execution ──────────────────────────────────────────────
@@ -902,16 +1523,42 @@ async def execute_workflow(
         execution_id,
     )
 
-    # Create execution stream
+    # Create execution stream and consolidated runtime
     await event_manager.create_stream(execution_id)
+
+    ProductionSafetyGuard.record_execution_start(execution_id)
+    RuntimePerformanceTracker.start_execution(execution_id)
+
+    try:
+        from app.infrastructure.infrastructure_coordinator import InfrastructureCoordinator
+
+        await InfrastructureCoordinator.get_instance().on_execution_start(
+            execution_id, workflow_id
+        )
+    except Exception as exc:
+        logger.debug("Infrastructure start hook skipped: %s", exc)
 
     # Initialize context
     ctx = ContextManager(execution_id=execution_id)
+    runtime = ExecutionRuntime(execution_id, ctx)
+    kernel = ExecutionKernel.for_execution(
+        execution_id, ctx, workflow_id=workflow_id
+    )
+    kernel.bind_runtime(runtime)
+    await kernel.initialize(_emit)
     ctx.set_context(workflow_description)
+    ctx.set_workflow_memory("node_count", agent_count)
+    for n in sorted_nodes:
+        tc = n.get("data", {}).get("taskComplexity")
+        if tc:
+            ctx.set_workflow_memory("task_complexity", tc)
+            break
+    tool_plans = ToolPlanner.plan_workflow_tools(sorted_nodes, workflow_description)
+    ToolPlanner.persist_workflow_plans(ctx, tool_plans)
     await ctx.persist()
 
-    await init_execution_state(
-        execution_id=execution_id,
+    runtime.lifecycle.set_phase(ExecutionPhase.PRE_EXECUTION)
+    await runtime.lifecycle.initialize(
         workflow_id=workflow_id,
         initial_state=RuntimeState.RUNNING,
         reason="Execution started",
@@ -920,6 +1567,7 @@ async def execute_workflow(
             "agentCount": agent_count,
         },
     )
+    runtime.lifecycle.set_phase(ExecutionPhase.EXECUTING)
 
     logs: list[dict[str, Any]] = []
     steps: list[dict[str, Any]] = []
@@ -945,37 +1593,28 @@ async def execute_workflow(
         "content": f"Starting workflow: {workflow_name} ({agent_count} nodes)",
     })
 
-    # Execute each node sequentially
-    for idx, node in enumerate(sorted_nodes, start=1):
-        node_data = node.get("data", {})
-        agent_name = node_data.get(
-            "label", node_data.get("role", f"Node {idx}")
+    # Adaptive DAG execution (parallel batches + runtime replanning)
+    safety = ProductionSafetyGuard.mid_execution_check(execution_id)
+    if not safety.allowed:
+        final_status = "failed"
+        final_error = safety.reason
+    else:
+        final_status, final_error, sorted_nodes = await _execute_nodes_adaptive(
+            execution_id=execution_id,
+            workflow_id=workflow_id,
+            workflow_name=workflow_name,
+            workflow_description=workflow_description,
+            sorted_nodes=sorted_nodes,
+            edges=edges,
+            ctx=ctx,
+            logs=logs,
+            steps=steps,
+            agent_timeout=agent_timeout,
         )
+        agent_count = len(sorted_nodes)
 
-        # Check cancellation before each node
-        if await _check_cancelled(execution_id, agent_name):
-            final_status = "cancelled"
-            break
-
-        # Check for approval gate
-        if _is_approval_node(node):
-            await _handle_approval_node(
-                execution_id=execution_id,
-                node=node,
-                idx=idx,
-                sorted_nodes=sorted_nodes,
-                ctx=ctx,
-                workflow_id=workflow_id,
-                workflow_name=workflow_name,
-                workflow_description=workflow_description,
-                logs=logs,
-                steps=steps,
-                edges=edges,
-                agent_count=agent_count,
-            )
-            # Return early — execution is paused waiting for approval
-            # The stream ends here; it will be re-created on resume
-            await _end_stream(execution_id)
+        if final_status == "waiting_approval":
+            runtime.lifecycle.set_phase(ExecutionPhase.WAITING_APPROVAL)
             return {
                 "executionId": execution_id,
                 "status": "waiting_approval",
@@ -984,47 +1623,83 @@ async def execute_workflow(
                 "error": None,
             }
 
-        # Execute agent step using shared logic
-        status, error = await _execute_agent_step(
-            execution_id=execution_id,
-            node=node,
-            idx=idx,
-            agent_count=agent_count,
-            ctx=ctx,
-            logs=logs,
-            steps=steps,
-            agent_timeout=agent_timeout,
-        )
-
-        if status == "cancelled":
-            final_status = "cancelled"
-            break
-        elif status == "failed":
-            final_status = "failed"
-            final_error = error
-            break
-
-        sorted_nodes = await _run_reflection_and_replanning(
-            execution_id=execution_id,
-            node=node,
-            idx=idx,
-            sorted_nodes=sorted_nodes,
-            edges=edges,
-            ctx=ctx,
-            logs=logs,
-        )
-        agent_count = len(sorted_nodes)
-
     # Finalise execution record
     completed_now = datetime.now(timezone.utc).isoformat()
 
     if final_status == "completed":
+        runtime.lifecycle.set_phase(ExecutionPhase.SYNTHESIZING)
         await _record_runtime_state(
             execution_id=execution_id,
             to_state=RuntimeState.COMPLETED,
             reason="Workflow completed successfully",
             metadata={"workflowName": workflow_name},
+            phase=ExecutionPhase.COMPLETED,
         )
+
+        # ── Final response synthesis ─────────────────────────────
+        synthesized_markdown = ""
+        synthesized_summary = ""
+        try:
+            await _emit(
+                execution_id,
+                "synthesis_started",
+                "system",
+                "Synthesizing final report from agent outputs...",
+            )
+            RuntimePerformanceTracker.begin_stage(execution_id, "synthesis", "system")
+            synthesis = FinalResponseSynthesizer.synthesize(
+                workflow_name=workflow_name,
+                objective=workflow_description,
+                steps=steps,
+                ctx=ctx,
+            )
+            synthesized_markdown = synthesis.markdown
+            synthesized_summary = synthesis.executive_summary
+            if synthesis.conflicts:
+                await _emit(
+                    execution_id,
+                    "synthesis_conflict_detected",
+                    "system",
+                    f"Resolved {len(synthesis.conflicts)} conflicting perspective(s)",
+                    conflicts=synthesis.conflicts,
+                    evidenceRanked=synthesis.evidence_ranked,
+                )
+            ctx.set_workflow_memory(
+                "final_synthesis",
+                {
+                    "markdown": synthesized_markdown,
+                    "executiveSummary": synthesized_summary,
+                    "actionableAnswer": synthesis.actionable_answer,
+                    "keyFindings": synthesis.key_findings,
+                    "risks": synthesis.risks,
+                    "recommendations": synthesis.recommendations,
+                    "toolCount": synthesis.tool_count,
+                    "retryCount": synthesis.retry_count,
+                    "qualityScore": synthesis.quality_score,
+                    "conflicts": synthesis.conflicts,
+                    "provenance": synthesis.provenance,
+                    "confidenceSummary": synthesis.confidence_summary,
+                },
+            )
+            await ctx.persist()
+            RuntimePerformanceTracker.end_stage(execution_id, "synthesis", "system")
+            await _emit(
+                execution_id,
+                "synthesis_completed",
+                "system",
+                "Final report ready",
+                synthesizedOutput=synthesized_markdown,
+                executiveSummary=synthesized_summary,
+                actionableAnswer=synthesis.actionable_answer,
+                keyFindings=synthesis.key_findings,
+                risks=synthesis.risks,
+                recommendations=synthesis.recommendations,
+                qualityScore=synthesis.quality_score,
+                provenance=synthesis.provenance,
+                confidenceSummary=synthesis.confidence_summary,
+            )
+        except Exception as exc:
+            logger.warning("Final synthesis failed for %s: %s", execution_id, exc)
 
         completion_log = {
             "id": uuid.uuid4().hex[:12],
@@ -1054,6 +1729,7 @@ async def execute_workflow(
             duration=(
                 datetime.now(timezone.utc) - datetime.fromisoformat(now)
             ).total_seconds(),
+            synthesizedOutput=synthesized_markdown or None,
         )
 
         all_outputs = ctx.get_all_outputs()
@@ -1063,7 +1739,12 @@ async def execute_workflow(
                 agent_outputs.append(
                     f"{s['agentName']}: {s['output'][:200]}"
                 )
-        summary_text = "\n".join(agent_outputs[:10])
+        summary_text = synthesized_summary or "\n".join(agent_outputs[:10])
+
+        output_payload = dict(all_outputs)
+        if synthesized_markdown:
+            output_payload["synthesized"] = synthesized_markdown
+            output_payload["executive_summary"] = synthesized_summary
 
         await db.execute(
             """UPDATE executions
@@ -1072,7 +1753,7 @@ async def execute_workflow(
                WHERE id = ?""",
             (
                 completed_now,
-                json.dumps(all_outputs),
+                json.dumps(output_payload),
                 summary_text,
                 execution_id,
             ),
@@ -1132,6 +1813,104 @@ async def execute_workflow(
             (completed_now, final_error, error_summary, execution_id),
         )
         await db.commit()
+
+    # Cognitive reflection + self-improvement (bounded, post-execution)
+    runtime.lifecycle.set_phase(ExecutionPhase.POST_EXECUTION)
+    if workflow_description.strip():
+        try:
+            from app.cognition.cognitive_orchestrator import CognitiveOrchestrator
+
+            await CognitiveOrchestrator.run_post_execution(
+                execution_id=execution_id,
+                objective=workflow_description,
+                status=final_status,
+                ctx=ctx,
+                emit_fn=_emit,
+            )
+        except Exception as exc:
+            logger.warning("Cognitive post-execution failed for %s: %s", execution_id, exc)
+
+    # Analytics + memory lifecycle + performance snapshot
+    started_dt = datetime.fromisoformat(now.replace("Z", "+00:00"))
+    if started_dt.tzinfo is None:
+        started_dt = started_dt.replace(tzinfo=timezone.utc)
+    duration = (datetime.now(timezone.utc) - started_dt).total_seconds()
+    retry_count = int(ctx.get_workflow_memory("global_retry_count") or 0)
+    tool_calls = ctx.get_workflow_memory("tool_calls") or []
+    cache_hits = int(ctx.get_workflow_memory("tool_cache_hits") or 0)
+    perf_snapshot: dict[str, Any] | None = None
+    try:
+        perf_snapshot = RuntimePerformanceTracker.finalize(execution_id)
+        if perf_snapshot:
+            await RuntimePerformanceTracker.persist_snapshot(execution_id, perf_snapshot)
+            await _emit(
+                execution_id,
+                "performance_summary",
+                "system",
+                f"Runtime: {perf_snapshot.get('totalDurationSeconds', 0)}s — "
+                f"{len(perf_snapshot.get('bottlenecks', []))} bottleneck(s)",
+                **perf_snapshot,
+            )
+        await runtime.telemetry.emit_diagnostics(ctx, _emit, perf_snapshot)
+        ctx.set_workflow_memory(
+            "lifecycle_transitions",
+            runtime.lifecycle.replay_transitions(),
+        )
+        await ExecutionAnalytics.record_execution_complete(
+            execution_id=execution_id,
+            status=final_status,
+            duration_seconds=duration,
+            retry_count=retry_count,
+            tool_count=len(tool_calls) if isinstance(tool_calls, list) else 0,
+            cache_hits=cache_hits,
+            failure_reason=final_error,
+        )
+        shared = ctx.get_state()
+        compact = await MemoryLifecycleManager.compact_execution_memory(
+            execution_id, shared.get("workflow", shared)
+        )
+        await db.execute(
+            "UPDATE executions SET shared_memory = ? WHERE id = ?",
+            (json.dumps(compact), execution_id),
+        )
+        await db.commit()
+    except Exception as exc:
+        logger.warning("Post-execution analytics/memory failed: %s", exc)
+
+    if workflow_description.strip():
+        try:
+            from app.self_improvement.self_improvement_orchestrator import (
+                SelfImprovementOrchestrator,
+            )
+
+            if SelfImprovementOrchestrator.is_enabled():
+                if perf_snapshot:
+                    ctx.set_workflow_memory("performance_snapshot", perf_snapshot)
+                    await ctx.persist()
+                await SelfImprovementOrchestrator.run_post_execution_cycle(
+                    execution_id=execution_id,
+                    objective=workflow_description,
+                    status=final_status,
+                    ctx=ctx,
+                    emit_fn=_emit,
+                )
+        except Exception as exc:
+            logger.warning("Self-improvement cycle failed for %s: %s", execution_id, exc)
+
+    try:
+        from app.infrastructure.infrastructure_coordinator import InfrastructureCoordinator
+
+        await InfrastructureCoordinator.get_instance().on_execution_complete(
+            execution_id, status=final_status
+        )
+    except Exception as exc:
+        logger.debug("Infrastructure complete hook skipped: %s", exc)
+
+    ProductionSafetyGuard.clear_execution(execution_id)
+    ExecutionStabilityMonitor.cleanup_execution(execution_id)
+    ExecutionRuntime.cleanup(execution_id)
+    ExecutionKernel.cleanup(execution_id)
+    MemoryRuntime.cleanup(execution_id)
 
     # Send sentinel to end the stream
     await _end_stream(execution_id)
@@ -1208,8 +1987,17 @@ async def resume_workflow(
     now = datetime.now(timezone.utc).isoformat()
     db = await get_db()
 
-    # Recreate stream
+    # Recreate stream and consolidated runtime
     await event_manager.create_stream(execution_id)
+
+    runtime = ExecutionRuntime(execution_id, ctx)
+    kernel = ExecutionKernel.for_execution(
+        execution_id, ctx, workflow_id=workflow_id
+    )
+    kernel.bind_runtime(runtime)
+    await kernel.initialize(_emit)
+    ctx.set_workflow_memory("node_count", agent_count)
+    runtime.lifecycle.set_phase(ExecutionPhase.EXECUTING)
 
     # Update status to running
     await db.execute(
@@ -1284,76 +2072,30 @@ async def resume_workflow(
     final_status = "completed"
     final_error: str | None = None
 
-    # Continue execution from next node
-    for idx, node in enumerate(sorted_nodes, start=1):
-        if idx <= current_idx:
-            continue
+    # Continue with adaptive scheduler from checkpoint position
+    final_status, final_error, sorted_nodes = await _execute_nodes_adaptive(
+        execution_id=execution_id,
+        workflow_id=workflow_id,
+        workflow_name=workflow_name,
+        workflow_description=workflow_description,
+        sorted_nodes=sorted_nodes,
+        edges=edges,
+        ctx=ctx,
+        logs=logs,
+        steps=steps,
+        agent_timeout=agent_timeout,
+        start_after_idx=current_idx,
+    )
+    agent_count = len(sorted_nodes)
 
-        node_data = node.get("data", {})
-        agent_name = node_data.get(
-            "label", node_data.get("role", f"Node {idx}")
-        )
-
-        # Check cancellation before each node
-        if await _check_cancelled(execution_id, agent_name):
-            final_status = "cancelled"
-            break
-
-        # Check if next node is also an approval gate
-        if _is_approval_node(node):
-            await _handle_approval_node(
-                execution_id=execution_id,
-                node=node,
-                idx=idx,
-                sorted_nodes=sorted_nodes,
-                ctx=ctx,
-                workflow_id=workflow_id,
-                workflow_name=workflow_name,
-                workflow_description=workflow_description,
-                logs=logs,
-                steps=steps,
-                edges=edges,
-                agent_count=agent_count,
-            )
-            await _end_stream(execution_id)
-            return {
-                "executionId": execution_id,
-                "status": "waiting_approval",
-                "steps": steps,
-                "logs": logs,
-                "error": None,
-            }
-
-        # Execute agent step using shared logic
-        status, error = await _execute_agent_step(
-            execution_id=execution_id,
-            node=node,
-            idx=idx,
-            agent_count=agent_count,
-            ctx=ctx,
-            logs=logs,
-            steps=steps,
-            agent_timeout=agent_timeout,
-        )
-
-        if status == "cancelled":
-            final_status = "cancelled"
-            break
-        elif status == "failed":
-            final_status = "failed"
-            final_error = error
-            break
-
-        sorted_nodes = await _run_reflection_and_replanning(
-            execution_id=execution_id,
-            node=node,
-            idx=idx,
-            sorted_nodes=sorted_nodes,
-            edges=edges,
-            ctx=ctx,
-            logs=logs,
-        )
-        agent_count = len(sorted_nodes)
+    if final_status == "waiting_approval":
+        return {
+            "executionId": execution_id,
+            "status": "waiting_approval",
+            "steps": steps,
+            "logs": logs,
+            "error": None,
+        }
 
     # Finalise
     completed_now = datetime.now(timezone.utc).isoformat()
@@ -1366,6 +2108,70 @@ async def resume_workflow(
             metadata={"workflowName": workflow_name},
         )
 
+        synthesized_markdown = ""
+        synthesized_summary = ""
+        try:
+            await _emit(
+                execution_id,
+                "synthesis_started",
+                "system",
+                "Synthesizing final report from agent outputs...",
+            )
+            RuntimePerformanceTracker.begin_stage(execution_id, "synthesis", "system")
+            synthesis = FinalResponseSynthesizer.synthesize(
+                workflow_name=workflow_name,
+                objective=workflow_description,
+                steps=steps,
+                ctx=ctx,
+            )
+            synthesized_markdown = synthesis.markdown
+            synthesized_summary = synthesis.executive_summary
+            if synthesis.conflicts:
+                await _emit(
+                    execution_id,
+                    "synthesis_conflict_detected",
+                    "system",
+                    f"Resolved {len(synthesis.conflicts)} conflicting perspective(s)",
+                    conflicts=synthesis.conflicts,
+                    evidenceRanked=synthesis.evidence_ranked,
+                )
+            ctx.set_workflow_memory(
+                "final_synthesis",
+                {
+                    "markdown": synthesized_markdown,
+                    "executiveSummary": synthesized_summary,
+                    "actionableAnswer": synthesis.actionable_answer,
+                    "keyFindings": synthesis.key_findings,
+                    "risks": synthesis.risks,
+                    "recommendations": synthesis.recommendations,
+                    "toolCount": synthesis.tool_count,
+                    "retryCount": synthesis.retry_count,
+                    "qualityScore": synthesis.quality_score,
+                    "conflicts": synthesis.conflicts,
+                    "provenance": synthesis.provenance,
+                    "confidenceSummary": synthesis.confidence_summary,
+                },
+            )
+            await ctx.persist()
+            RuntimePerformanceTracker.end_stage(execution_id, "synthesis", "system")
+            await _emit(
+                execution_id,
+                "synthesis_completed",
+                "system",
+                "Final report ready",
+                synthesizedOutput=synthesized_markdown,
+                executiveSummary=synthesized_summary,
+                actionableAnswer=synthesis.actionable_answer,
+                keyFindings=synthesis.key_findings,
+                risks=synthesis.risks,
+                recommendations=synthesis.recommendations,
+                qualityScore=synthesis.quality_score,
+                provenance=synthesis.provenance,
+                confidenceSummary=synthesis.confidence_summary,
+            )
+        except Exception as exc:
+            logger.warning("Final synthesis failed for %s: %s", execution_id, exc)
+
         await _emit(
             execution_id,
             "workflow_completed",
@@ -1374,6 +2180,7 @@ async def resume_workflow(
             executionId=execution_id,
             totalAgents=agent_count,
             duration=0,
+            synthesizedOutput=synthesized_markdown or None,
         )
 
         all_outputs = ctx.get_all_outputs()
@@ -1383,7 +2190,12 @@ async def resume_workflow(
                 agent_outputs.append(
                     f"{s['agentName']}: {s['output'][:200]}"
                 )
-        summary_text = "\n".join(agent_outputs[:10])
+        summary_text = synthesized_summary or "\n".join(agent_outputs[:10])
+
+        output_payload = dict(all_outputs)
+        if synthesized_markdown:
+            output_payload["synthesized"] = synthesized_markdown
+            output_payload["executive_summary"] = synthesized_summary
 
         await db.execute(
             """UPDATE executions
@@ -1392,7 +2204,7 @@ async def resume_workflow(
                WHERE id = ?""",
             (
                 completed_now,
-                json.dumps(all_outputs),
+                json.dumps(output_payload),
                 summary_text,
                 execution_id,
             ),
@@ -1447,6 +2259,16 @@ async def resume_workflow(
             (completed_now, final_error, execution_id),
         )
         await db.commit()
+
+    try:
+        perf_snapshot = RuntimePerformanceTracker.finalize(execution_id)
+        await runtime.telemetry.emit_diagnostics(ctx, _emit, perf_snapshot)
+    except Exception as exc:
+        logger.warning("Resume telemetry failed: %s", exc)
+
+    ExecutionStabilityMonitor.cleanup_execution(execution_id)
+    ExecutionRuntime.cleanup(execution_id)
+    MemoryRuntime.cleanup(execution_id)
 
     await _end_stream(execution_id)
 

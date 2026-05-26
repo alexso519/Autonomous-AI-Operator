@@ -1,0 +1,46 @@
+services:
+  backend:
+    build: ./backend
+    ports:
+      - "8000:8000"
+    environment:
+      - ENABLE_DISTRIBUTED_RUNTIME=1
+      - ENABLE_RUNTIME_MESH=1
+      - ENABLE_POLICY_ENGINE=1
+      - ENABLE_COST_METERING=1
+      - ENABLE_INFRA_INTELLIGENCE=1
+      - ENABLE_AUTOSCALING=1
+      - ENABLE_APPROVAL_WORKFLOWS=1
+      - ENABLE_RBAC=1
+      - ENABLE_MULTI_TENANCY=1
+      - COMPLIANCE_MODE=enterprise
+      - DEFAULT_EXECUTION_BUDGET=500
+      - REDIS_URL=redis://redis:6379/0
+      - DATABASE_PATH=/app/data/workflows.db
+      - JWT_SECRET=${JWT_SECRET:-change-me-in-production}
+    volumes:
+      - operator-data:/app/data
+    depends_on:
+      - redis
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/infrastructure/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+
+  frontend:
+    build: ./frontend
+    ports:
+      - "3000:3000"
+    environment:
+      - NEXT_PUBLIC_API_URL=http://localhost:8000
+    depends_on:
+      - backend
+
+volumes:
+  operator-data:

@@ -1,0 +1,56 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: runtime-mesh-config
+  labels:
+    app: autonomous-ai-operator
+data:
+  ENABLE_RUNTIME_MESH: "1"
+  ENABLE_DISTRIBUTED_RUNTIME: "1"
+  RUNTIME_MESH_NODE_ID: "mesh-node"
+  COMPLIANCE_MODE: "enterprise"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: autonomous-ai-runtime-mesh
+  labels:
+    app: autonomous-ai-operator
+    component: runtime-mesh
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: autonomous-ai-operator
+      component: runtime-mesh
+  template:
+    metadata:
+      labels:
+        app: autonomous-ai-operator
+        component: runtime-mesh
+    spec:
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchExpressions:
+                    - key: component
+                      operator: In
+                      values: ["runtime-mesh"]
+                topologyKey: kubernetes.io/hostname
+      containers:
+        - name: backend
+          image: autonomous-ai-operator:latest
+          envFrom:
+            - configMapRef:
+                name: runtime-mesh-config
+          ports:
+            - containerPort: 8000
+          livenessProbe:
+            httpGet:
+              path: /api/infrastructure/health
+              port: 8000
+            initialDelaySeconds: 30
+            periodSeconds: 15

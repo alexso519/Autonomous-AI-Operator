@@ -10,7 +10,6 @@ This service sits above the existing execution engine and orchestrates:
 It intentionally reuses the existing engine, streaming and persistence
 layers without modifying them.
 """
-import asyncio
 import json
 import logging
 import uuid
@@ -46,8 +45,57 @@ class AutonomousExecutionService:
         # 1. Analyze
         analysis = await self._analyzer.analyze(objective)
 
+        # 1b. Production safety rate limit
+        from app.execution.production_safety import ProductionSafetyGuard
+
+        active = execution_manager.count_active()
+        safety = ProductionSafetyGuard.pre_start_check(active)
+        if not safety.allowed:
+            raise RuntimeError(f"Cannot start execution: {safety.reason}")
+
+        from app.execution.runtime_hardening import RuntimeHardening
+
+        ok, bp_reason = RuntimeHardening.check_backpressure(active)
+        if not ok:
+            raise RuntimeError(f"Cannot start execution: {bp_reason}")
+
+        # 1c. Optimize agent spawn count
+        from app.execution.agent_spawn_optimizer import AgentSpawnOptimizer
+
+        analysis = AgentSpawnOptimizer.apply_to_analysis(analysis)
+
         # 2. Deterministic plan from analysis
         nodes, edges = self._planner.plan(analysis)
+
+        from app.execution.research_agents import (
+            apply_research_profiles,
+            is_research_objective,
+        )
+        from app.execution.coding_agents import (
+            apply_coding_profiles,
+            is_computer_use_objective,
+        )
+
+        if is_computer_use_objective(objective):
+            nodes = apply_coding_profiles(nodes, objective)
+        elif is_research_objective(objective):
+            nodes = apply_research_profiles(nodes, objective)
+
+        # 2b. Attach tool plans to nodes for observability
+        from app.execution.tool_planning import ToolPlanner
+
+        tool_plans = ToolPlanner.plan_workflow_tools(nodes, analysis.objective)
+        nodes = [
+            ToolPlanner.inject_node_data(n, tool_plans[n["id"]])
+            if n.get("id") in tool_plans
+            else n
+            for n in nodes
+        ]
+        # Inject task complexity for model routing
+        for n in nodes:
+            if n.get("type", n.get("data", {}).get("nodeType")) != "approval":
+                n.setdefault("data", {})["taskComplexity"] = analysis.complexity.value
+                break
 
         # 3. Persist workflow
         workflow_id = str(uuid.uuid4())
@@ -80,22 +128,36 @@ class AutonomousExecutionService:
         )
         await db.commit()
 
-        # 5. Launch engine execution task
-        # Import here to avoid circular imports
+        spawn_plan = AgentSpawnOptimizer.optimize(analysis)
+        await AgentSpawnOptimizer.persist_spawn_plan(
+            execution_id, spawn_plan, analysis.task_type.value
+        )
+
+        # 5. Register and launch execution through the manager.
+        # register() is async — it acquires the per-execution lock, wraps the
+        # coroutine in _wrap_execution (SSE + cleanup guarantees), and creates
+        # the asyncio.Task.  Passing the raw coroutine (not a pre-created task)
+        # is required so the manager owns the full lifecycle.
         from app.execution.engine import execute_workflow
 
-        task = asyncio.create_task(
-            execute_workflow(
+        task = await execution_manager.register(
+            execution_id=execution_id,
+            workflow_id=workflow_id,
+            coro=execute_workflow(
                 execution_id=execution_id,
                 workflow_id=workflow_id,
                 nodes=nodes,
                 edges=edges,
                 workflow_name=workflow_name,
                 workflow_description=analysis.objective,
-            )
+            ),
+            owner_id="autonomous",
         )
 
-        execution_manager.register(execution_id, workflow_id, task)
+        if task is None:
+            raise RuntimeError(
+                f"Could not start execution {execution_id}: lock contention"
+            )
 
         logger.info("Autonomous execution started | exec=%s workflow=%s", execution_id, workflow_id)
 

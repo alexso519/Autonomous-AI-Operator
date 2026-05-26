@@ -1,0 +1,24 @@
+{
+  "executionId": "test-exec-desktop",
+  "activeWindow": "Realtek Audio Console",
+  "openWindows": [
+    "Realtek Audio Console",
+    ".env.example - Autonomous-AI-Operator - Visual Studio Code",
+    "Cursor Agents",
+    "Images - Docker Desktop",
+    "AI \u591a\u4ee3\u7406\u5de5\u4f5c\u5e73\u53f0 \u548c\u5176\u4ed6 9 \u500b\u9801\u9762 - \u500b\u4eba - Microsoft? Edge",
+    "Ollama",
+    "Proton VPN",
+    "Realtek Audio Console",
+    "\u526a\u53d6\u5de5\u5177",
+    "\u8a2d\u5b9a",
+    "Windows \u8f38\u5165\u9ad4\u9a57",
+    "\u547d\u4ee4\u63d0\u793a\u5b57\u5143 - docker  compose up --build"
+  ],
+  "clipboardExcerpt": "",
+  "workspacePath": "C:\\Users\\user\\Downloads\\Autonomous-AI-Operator\\backend\\data\\sandboxes\\test-exec-de\\084e6c78",
+  "lastSnapshotId": "",
+  "checkpointLabel": "post_execution",
+  "updatedAt": "2026-05-26T18:03:58.894662+00:00",
+  "metadata": {}
+}

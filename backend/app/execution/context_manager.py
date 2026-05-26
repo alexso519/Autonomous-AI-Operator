@@ -4,15 +4,15 @@ Shared execution context manager.
 This manager maintains workflow-level and node-level memory, stores
 intermediate agent outputs, and can persist shared state into SQLite.
 
+Context assembly is delegated to the unified ContextAssembler via
+get_combined_context() — agents should not manually concatenate blocks.
+
 Memory model:
   - Initial workflow context
   - Workflow-level shared memory
   - Per-node memory / metadata
   - Agent outputs keyed by node_id
   - Approval decisions and execution metadata
-
-The goal is stable, deterministic shared state that downstream agents
-can consume without introducing external memory systems.
 """
 
 import json
@@ -39,7 +39,8 @@ class ContextManager:
         self._workflow_memory: dict[str, Any] = {}
         self._node_memory: dict[str, dict[str, Any]] = {}
         self._outputs: dict[str, dict[str, Any]] = {}
-        self._approval_memory: dict[str, dict[str, Any]] = {}
+        self._approval_memory: dict[str, Any] = {}
+        self._context_budget = None  # lazy-loaded ContextBudget
 
     def set_context(self, context: str) -> None:
         """Set the initial workflow-level context."""
@@ -48,6 +49,10 @@ class ContextManager:
     def get_initial_context(self) -> str:
         """Return the initial workflow-level context."""
         return self._initial_context
+
+    def get_context(self) -> str:
+        """Alias for get_initial_context (backward compatibility)."""
+        return self.get_initial_context()
 
     def set_workflow_memory(self, key: str, value: Any) -> None:
         """Store a workflow-level memory item."""
@@ -113,25 +118,38 @@ class ContextManager:
         self.set_workflow_memory("last_approval", {"node_id": node_id, "decision": decision})
         logger.debug("Approval memory stored for node %s: %s", node_id, decision)
 
-    def get_combined_context(self) -> str:
-        """Return the combined shared context passed to downstream agents."""
-        parts: list[str] = []
+    def get_combined_context(
+        self,
+        model_tier: str = "standard",
+        is_synthesis: bool = False,
+        is_retry: bool = False,
+        agent_name: str = "",
+        agent_role: str = "",
+        tool_plan_block: str = "",
+    ) -> str:
+        """Return compressed shared context via unified ContextAssembler."""
+        from app.execution.context_assembler import ContextAssembler
+        from app.execution.retrieval_planner import AssemblyRequest
 
-        if self._initial_context:
-            parts.append(f"Workflow Context:\n{self._initial_context}")
+        research_mode = bool(self.get_workflow_memory("autonomous_research_mode"))
+        confidence = self.get_workflow_memory("last_confidence")
+        if isinstance(confidence, dict):
+            confidence = confidence.get("score")
 
-        if self._workflow_memory:
-            parts.append("\nShared Workflow Memory:")
-            for key, value in self._workflow_memory.items():
-                formatted = json.dumps(value, ensure_ascii=False) if not isinstance(value, str) else value
-                parts.append(f"- {key}: {formatted}")
-
-        if self._outputs:
-            parts.append("\nPrevious Agent Outputs:")
-            for node_id, entry in self._outputs.items():
-                parts.append(f"[{entry['agent_name']}]: {entry['output']}")
-
-        return "\n\n".join(parts)
+        assembler = ContextAssembler.for_context(self, execution_id=self.execution_id or "")
+        request = AssemblyRequest(
+            model_tier=model_tier,
+            is_synthesis=is_synthesis,
+            is_retry=is_retry,
+            agent_name=agent_name,
+            agent_role=agent_role,
+            task_complexity=str(self.get_workflow_memory("task_complexity") or "moderate"),
+            confidence_score=float(confidence) if confidence is not None else None,
+            research_mode=research_mode,
+            tool_plan_block=tool_plan_block,
+        )
+        result = assembler.assemble_sync(request)
+        return result.context
 
     def get_latest_output(self) -> str:
         """Return the most recent agent output only."""

@@ -149,6 +149,37 @@ class HttpPostOutput(ToolBaseOutput):
     response_body: str = Field(..., description="Response body text")
 
 
+class WebSearchInput(ToolBaseInput):
+    query: str = Field(..., min_length=1, max_length=500, description="Search query")
+    max_results: int = Field(5, ge=1, le=10, description="Maximum number of results")
+
+
+class WebSearchResult(BaseModel):
+    title: str = Field(..., description="Result title")
+    url: str = Field(..., description="Result URL")
+    snippet: str = Field(..., description="Short excerpt")
+
+
+class WebSearchOutput(ToolBaseOutput):
+    query: str = Field(..., description="Original search query")
+    results: list[WebSearchResult] = Field(default_factory=list, description="Search hits")
+    source: str = Field(..., description="Search provider used")
+
+
+class WebpageFetchInput(ToolBaseInput):
+    url: str = Field(..., description="Public HTTP/HTTPS URL to fetch")
+    max_bytes: int = Field(8192, ge=256, le=65536, description="Maximum response bytes")
+    timeout_seconds: int = Field(10, ge=1, le=30, description="Request timeout")
+
+
+class WebpageFetchOutput(ToolBaseOutput):
+    url: str = Field(..., description="Fetched URL")
+    status_code: int = Field(..., description="HTTP status code")
+    content_type: str = Field(..., description="Response content type")
+    text: str = Field(..., description="Extracted plain text")
+    truncated: bool = Field(..., description="Whether content was truncated")
+
+
 @dataclass
 class ToolDefinition:
     name: str

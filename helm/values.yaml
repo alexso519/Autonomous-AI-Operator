@@ -1,0 +1,38 @@
+replicaCount: 1
+
+image:
+  repository: autonomous-ai-operator
+  tag: latest
+  pullPolicy: IfNotPresent
+
+service:
+  type: ClusterIP
+  port: 8000
+
+runtime:
+  enableDistributedRuntime: false
+  enableRuntimeMesh: false
+  enablePolicyEngine: false
+  enableCostMetering: false
+  enableInfraIntelligence: false
+  enableAutoscaling: false
+  complianceMode: local_dev
+  defaultExecutionBudget: 100.0
+
+redis:
+  enabled: false
+  url: ""
+
+resources:
+  limits:
+    cpu: 2000m
+    memory: 4Gi
+  requests:
+    cpu: 500m
+    memory: 1Gi
+
+autoscaling:
+  enabled: false
+  minReplicas: 1
+  maxReplicas: 4
+  targetCPUUtilization: 70

@@ -1,0 +1,30 @@
+replicaCount: 3
+
+runtime:
+  enableDistributedRuntime: true
+  enableRuntimeMesh: true
+  enablePolicyEngine: true
+  enableCostMetering: true
+  enableInfraIntelligence: true
+  enableAutoscaling: true
+  enableApprovalWorkflows: true
+  complianceMode: enterprise
+  defaultExecutionBudget: 500.0
+
+redis:
+  enabled: true
+  url: redis://redis:6379/0
+
+autoscaling:
+  enabled: true
+  minReplicas: 2
+  maxReplicas: 12
+  targetCPUUtilization: 70
+
+resources:
+  limits:
+    cpu: 4000m
+    memory: 8Gi
+  requests:
+    cpu: 1000m
+    memory: 2Gi

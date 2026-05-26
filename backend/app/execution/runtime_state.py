@@ -3,6 +3,10 @@ Runtime state machine for workflow execution.
 
 This module records deterministic execution lifecycle transitions
 and persists them to the database for offline inspection.
+
+NOTE: New code should prefer LifecycleManager from runtime_lifecycle.py
+for transition validation, phase tracking, and replay support.
+The functions here remain as the persistence layer and backward-compatible API.
 """
 
 import json

@@ -31,6 +31,7 @@ services:
     build:
       context: ./frontend
       dockerfile: Dockerfile
+      target: dev
     container_name: ai-frontend
     ports:
       - "3000:3000"
@@ -56,6 +57,30 @@ services:
     volumes:
       # Persistent model storage (won't re-download on restart)
       - ollama_models:/root/.ollama
+    networks:
+      - workspace-net
+
+  # ─── Ollama model pull (one-shot init) ───────────────────
+  # Waits for Ollama to be ready, then pulls the required model.
+  # Safe to re-run — Ollama skips the download if already present.
+  ollama-init:
+    image: ollama/ollama:latest
+    container_name: ai-ollama-init
+    restart: "no"
+    environment:
+      - OLLAMA_HOST=http://ollama:11434
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        echo "Waiting for Ollama to be ready..."
+        until ollama list > /dev/null 2>&1; do sleep 2; done
+        echo "Ollama ready. Pulling qwen2.5:3b..."
+        ollama pull qwen2.5:3b
+        echo "Model pull complete."
+    volumes:
+      - ollama_models:/root/.ollama
+    depends_on:
+      - ollama
     networks:
       - workspace-net
 

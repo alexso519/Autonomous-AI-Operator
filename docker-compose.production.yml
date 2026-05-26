@@ -1,0 +1,120 @@
+# Production deployment — distributed cluster with Redis, observability stack
+# Usage: docker compose -f docker-compose.production.yml up -d
+
+services:
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    ports:
+      - "${BACKEND_PORT:-8000}:8000"
+    environment:
+      HOST: 0.0.0.0
+      BACKEND_PORT: 8000
+      OLLAMA_URL: ${OLLAMA_URL:-http://ollama:11434}
+      DATABASE_PATH: /app/data/workflows.db
+      REDIS_URL: redis://redis:6379/0
+      ENABLE_DISTRIBUTED_RUNTIME: "1"
+      ENABLE_RBAC: ${ENABLE_RBAC:-0}
+      ENABLE_MULTI_TENANCY: ${ENABLE_MULTI_TENANCY:-0}
+      ENABLE_OTEL_TRACING: ${ENABLE_OTEL_TRACING:-0}
+      MAX_WORKER_CONCURRENCY: ${MAX_WORKER_CONCURRENCY:-8}
+      WORKER_HEARTBEAT_SECONDS: ${WORKER_HEARTBEAT_SECONDS:-30}
+      JWT_SECRET: ${JWT_SECRET:-}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      DEPLOYMENT_PROFILE: ${DEPLOYMENT_PROFILE:-distributed_cluster}
+    volumes:
+      - backend_data:/app/data
+    depends_on:
+      - redis
+      - ollama
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/infrastructure/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    command: ["python", "-c", "import asyncio; from app.infrastructure.infrastructure_coordinator import InfrastructureCoordinator; asyncio.run(InfrastructureCoordinator.get_instance().initialize())"]
+    environment:
+      OLLAMA_URL: ${OLLAMA_URL:-http://ollama:11434}
+      DATABASE_PATH: /app/data/workflows.db
+      REDIS_URL: redis://redis:6379/0
+      ENABLE_DISTRIBUTED_RUNTIME: "1"
+      MAX_WORKER_CONCURRENCY: ${MAX_WORKER_CONCURRENCY:-4}
+      WORKER_HEARTBEAT_SECONDS: ${WORKER_HEARTBEAT_SECONDS:-30}
+    volumes:
+      - backend_data:/app/data
+    depends_on:
+      - backend
+      - redis
+    restart: unless-stopped
+    deploy:
+      replicas: 2
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    ports:
+      - "3000:3000"
+    environment:
+      NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:8000}
+    depends_on:
+      - backend
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  ollama:
+    image: ollama/ollama:latest
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    restart: unless-stopped
+
+  prometheus:
+    image: prom/prometheus:v2.51.0
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./k8s/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    depends_on:
+      - backend
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:10.4.0
+    ports:
+      - "3001:3000"
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-admin}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./k8s/grafana/datasource.yml:/etc/grafana/provisioning/datasources/datasource.yml:ro
+    depends_on:
+      - prometheus
+    restart: unless-stopped
+
+volumes:
+  backend_data:
+  redis_data:
+  ollama_data:
+  grafana_data:

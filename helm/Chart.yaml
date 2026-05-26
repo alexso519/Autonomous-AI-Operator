@@ -1,0 +1,6 @@
+apiVersion: v2
+name: autonomous-ai-operator
+description: Autonomous AI Operator — federated runtime with enterprise governance
+type: application
+version: 0.2.0
+appVersion: "1.0.0"

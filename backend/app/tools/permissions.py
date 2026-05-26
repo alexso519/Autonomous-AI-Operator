@@ -1,12 +1,15 @@
+import ipaddress
 import os
 import re
 import shlex
+import socket
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 from app.tools.tool_models import ToolDefinition, ToolExecutionError
 
-PROJECT_ROOT = Path(__file__).resolve().parents[4]
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 ALLOWED_READ_ROOTS = [PROJECT_ROOT]
 ALLOWED_WRITE_ROOTS = [PROJECT_ROOT / "data", PROJECT_ROOT / "backend" / "app"]
 SHELL_WHITELIST = {
@@ -22,6 +25,49 @@ SHELL_WHITELIST = {
 }
 
 HTTP_URL_PATTERN = re.compile(r"^https?://[A-Za-z0-9._:-]+(?:/.*)?$")
+
+# Blocked hostnames for outbound fetch/search
+_BLOCKED_HOSTS = frozenset({
+    "localhost",
+    "127.0.0.1",
+    "0.0.0.0",
+    "::1",
+})
+
+
+def _is_private_ip(hostname: str) -> bool:
+    """Return True if hostname resolves to a private/loopback address."""
+    try:
+        for info in socket.getaddrinfo(hostname, None):
+            addr = info[4][0]
+            ip = ipaddress.ip_address(addr)
+            if ip.is_private or ip.is_loopback or ip.is_link_local:
+                return True
+    except (socket.gaierror, ValueError):
+        return False
+    return False
+
+
+def validate_http_get_url(url: str) -> str:
+    """Validate a URL for safe read-only HTTP GET requests."""
+    if not HTTP_URL_PATTERN.match(url):
+        raise ToolExecutionError("URL must be a valid http or https address.")
+
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        raise ToolExecutionError("Only http and https URLs are allowed.")
+
+    hostname = (parsed.hostname or "").lower()
+    if not hostname:
+        raise ToolExecutionError("URL must include a hostname.")
+
+    if hostname in _BLOCKED_HOSTS:
+        raise ToolExecutionError("Access to local/private hosts is not allowed.")
+
+    if _is_private_ip(hostname):
+        raise ToolExecutionError("Access to private network addresses is not allowed.")
+
+    return url
 
 
 def _resolve_path(path: str) -> Path:
@@ -110,5 +156,10 @@ def validate_tool_request(definition: ToolDefinition, input_data: Any) -> None:
         pass
     elif name in {"calculator", "markdown_generator", "structured_data_extractor"}:
         pass
+    elif name == "web_search":
+        if not input_data.query.strip():
+            raise ToolExecutionError("Search query cannot be empty.")
+    elif name == "webpage_fetch":
+        validate_http_get_url(input_data.url)
     else:
         raise ToolExecutionError(f"No specific validation rule for tool '{name}'.")

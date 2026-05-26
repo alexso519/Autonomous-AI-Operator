@@ -1,0 +1,103 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: operator-backend
+  labels:
+    app: operator-backend
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: operator-backend
+  template:
+    metadata:
+      labels:
+        app: operator-backend
+    spec:
+      containers:
+        - name: backend
+          image: operator-backend:latest
+          ports:
+            - containerPort: 8000
+          env:
+            - name: ENABLE_DISTRIBUTED_RUNTIME
+              value: "1"
+            - name: REDIS_URL
+              valueFrom:
+                secretKeyRef:
+                  name: operator-secrets
+                  key: redis-url
+            - name: DATABASE_PATH
+              value: /data/workflows.db
+            - name: MAX_WORKER_CONCURRENCY
+              value: "8"
+            - name: WORKER_HEARTBEAT_SECONDS
+              value: "30"
+          volumeMounts:
+            - name: data
+              mountPath: /data
+          livenessProbe:
+            httpGet:
+              path: /api/infrastructure/health
+              port: 8000
+            initialDelaySeconds: 15
+            periodSeconds: 30
+          readinessProbe:
+            httpGet:
+              path: /api/health
+              port: 8000
+            initialDelaySeconds: 5
+            periodSeconds: 10
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: operator-data-pvc
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: operator-backend
+spec:
+  selector:
+    app: operator-backend
+  ports:
+    - port: 8000
+      targetPort: 8000
+  type: ClusterIP
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: operator-worker
+  labels:
+    app: operator-worker
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: operator-worker
+  template:
+    metadata:
+      labels:
+        app: operator-worker
+    spec:
+      containers:
+        - name: worker
+          image: operator-backend:latest
+          env:
+            - name: ENABLE_DISTRIBUTED_RUNTIME
+              value: "1"
+            - name: REDIS_URL
+              valueFrom:
+                secretKeyRef:
+                  name: operator-secrets
+                  key: redis-url
+            - name: MAX_WORKER_CONCURRENCY
+              value: "4"
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "512Mi"
+            limits:
+              cpu: "2"
+              memory: "2Gi"
