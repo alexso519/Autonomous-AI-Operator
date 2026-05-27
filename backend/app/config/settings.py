@@ -187,6 +187,35 @@ class Settings:
         default_factory=lambda: os.getenv("SELF_IMPROVEMENT_DRY_RUN", "1") == "1"
     )
 
+    # ── Recursive intelligence / Phase 2 (optional, off by default) ──
+    enable_meta_reflection: bool = field(
+        default_factory=lambda: os.getenv("ENABLE_META_REFLECTION", "0") == "1"
+    )
+    enable_capability_discovery: bool = field(
+        default_factory=lambda: os.getenv("ENABLE_CAPABILITY_DISCOVERY", "0") == "1"
+    )
+    enable_adversarial_benchmarking: bool = field(
+        default_factory=lambda: os.getenv("ENABLE_ADVERSARIAL_BENCHMARKING", "0") == "1"
+    )
+    enable_coordination_evolution: bool = field(
+        default_factory=lambda: os.getenv("ENABLE_COORDINATION_EVOLUTION", "0") == "1"
+    )
+    enable_predictive_runtime: bool = field(
+        default_factory=lambda: os.getenv("ENABLE_PREDICTIVE_RUNTIME", "0") == "1"
+    )
+    max_recursive_reflection_depth: int = field(
+        default_factory=lambda: int(os.getenv("MAX_RECURSIVE_REFLECTION_DEPTH", "2"))
+    )
+    max_autonomous_evolution_cycles_per_day: int = field(
+        default_factory=lambda: int(os.getenv("MAX_AUTONOMOUS_EVOLUTION_CYCLES_PER_DAY", "20"))
+    )
+    self_evolution_kill_switch: bool = field(
+        default_factory=lambda: os.getenv("SELF_EVOLUTION_KILL_SWITCH", "0") == "1"
+    )
+    unsafe_emergence_threshold: float = field(
+        default_factory=lambda: float(os.getenv("UNSAFE_EMERGENCE_THRESHOLD", "0.92"))
+    )
+
 
 # Singleton — import this anywhere to get current settings.
 settings = Settings()

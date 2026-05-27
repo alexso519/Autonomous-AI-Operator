@@ -154,6 +154,30 @@ class SelfImprovementOrchestrator:
         )
         await ctx.persist()
 
+        phase2_results: dict[str, Any] | None = None
+        try:
+            from app.self_improvement.recursive_intelligence_coordinator import (
+                RecursiveIntelligenceCoordinator,
+            )
+
+            if RecursiveIntelligenceCoordinator.is_enabled():
+                workflow_snapshot = ctx.get_state().get("workflow", {})
+                if not isinstance(workflow_snapshot, dict):
+                    workflow_snapshot = {}
+                phase2_results = await RecursiveIntelligenceCoordinator.run_phase2_cycle(
+                    execution_id=execution_id,
+                    objective=objective,
+                    status=status,
+                    ctx_snapshot=workflow_snapshot,
+                    emit_fn=emit_fn,
+                    perf_snapshot=perf_snapshot,
+                )
+                if phase2_results and not phase2_results.get("skipped"):
+                    reasoning["phase2"] = "recursive intelligence cycle completed"
+        except Exception as exc:
+            logger.warning("Phase 2 recursive intelligence cycle failed: %s", exc)
+            phase2_results = {"error": str(exc)}
+
         await emit_fn(
             execution_id,
             "improvement_cycle_completed",
@@ -162,6 +186,7 @@ class SelfImprovementOrchestrator:
             sessionId=session_id,
             dryRun=dry_run,
             rollbackId=rollback_id,
+            phase2=phase2_results is not None and not phase2_results.get("skipped"),
         )
 
         return {
@@ -169,6 +194,7 @@ class SelfImprovementOrchestrator:
             "dryRun": dry_run,
             "reasoning": reasoning,
             "results": results,
+            "phase2": phase2_results,
         }
 
     @classmethod
@@ -191,7 +217,7 @@ class SelfImprovementOrchestrator:
     @classmethod
     async def get_dashboard_snapshot(cls, limit: int = 20) -> dict[str, Any]:
         await ImprovementMemoryStore.ensure_tables()
-        return {
+        snapshot: dict[str, Any] = {
             "sessions": await ImprovementMemoryStore.query_recent("improvement_sessions", limit=limit),
             "heuristicGenerations": await ImprovementMemoryStore.query_recent(
                 "heuristic_generations", limit=limit
@@ -202,6 +228,18 @@ class SelfImprovementOrchestrator:
             "promptVariants": await ImprovementMemoryStore.query_recent("prompt_variants", limit=limit),
             "policy": await EvolutionPolicy.get_active_policy(),
         }
+        try:
+            from app.self_improvement.recursive_intelligence_coordinator import (
+                RecursiveIntelligenceCoordinator,
+            )
+
+            if RecursiveIntelligenceCoordinator.is_enabled():
+                snapshot["phase2"] = await RecursiveIntelligenceCoordinator.get_phase2_dashboard(limit=limit)
+            else:
+                snapshot["phase2"] = {"enabled": False}
+        except Exception:
+            snapshot["phase2"] = {"enabled": False}
+        return snapshot
 
     @classmethod
     async def replay_session(cls, session_id: str) -> dict[str, Any] | None:
