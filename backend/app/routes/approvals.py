@@ -27,6 +27,8 @@ import logging
 
 from fastapi import APIRouter, HTTPException
 
+from app.config.http_errors import http_error
+from app.config.locale import t
 from app.database.database import get_db
 from app.execution.engine import resume_workflow, reject_execution
 from app.execution.manager import execution_manager
@@ -56,16 +58,12 @@ async def _verify_waiting_approval(execution_id: str) -> dict:
     row = await cursor.fetchone()
 
     if row is None:
-        raise HTTPException(status_code=404, detail="Execution not found")
+        raise http_error(404, "execution_not_found")
 
     status = dict(row)["status"]
 
     if status != "waiting_approval":
-        raise HTTPException(
-            status_code=409,
-            detail=f"Execution is not waiting for approval (current status: {status}). "
-                   f"Only 'waiting_approval' executions can be acted upon.",
-        )
+        raise http_error(409, "not_waiting_approval_detail", status=status)
 
     return dict(row)
 
@@ -89,10 +87,7 @@ async def approve_execution(execution_id: str) -> dict:
         execution_id, "approve"
     )
     if not acquired:
-        raise HTTPException(
-            status_code=409,
-            detail="Another approval action is already in progress for this execution",
-        )
+        raise http_error(409, "approval_in_progress")
 
     try:
         # Re-verify status after acquiring lock
@@ -103,10 +98,7 @@ async def approve_execution(execution_id: str) -> dict:
         )
         row = await cursor.fetchone()
         if not row or dict(row)["status"] != "waiting_approval":
-            raise HTTPException(
-                status_code=409,
-                detail="Execution status changed before approval could be processed",
-            )
+            raise http_error(409, "status_changed_approval")
 
         result = await resume_workflow(execution_id)
         logger.info("Execution %s approved and resumed", execution_id)
@@ -120,10 +112,7 @@ async def approve_execution(execution_id: str) -> dict:
         raise HTTPException(status_code=500, detail=str(e))
     except Exception as e:
         logger.error("Failed to resume execution %s: %s", execution_id, e)
-        raise HTTPException(
-            status_code=500,
-            detail=f"Failed to resume execution: {e}",
-        )
+        raise http_error(500, "resume_failed", error=str(e))
     finally:
         execution_manager._execution_lock.release(execution_id)
 
@@ -147,10 +136,7 @@ async def reject_execution_endpoint(execution_id: str) -> dict:
         execution_id, "reject"
     )
     if not acquired:
-        raise HTTPException(
-            status_code=409,
-            detail="Another approval action is already in progress for this execution",
-        )
+        raise http_error(409, "approval_in_progress")
 
     try:
         # Re-verify status after acquiring lock
@@ -161,10 +147,7 @@ async def reject_execution_endpoint(execution_id: str) -> dict:
         )
         row = await cursor.fetchone()
         if not row or dict(row)["status"] != "waiting_approval":
-            raise HTTPException(
-                status_code=409,
-                detail="Execution status changed before rejection could be processed",
-            )
+            raise http_error(409, "status_changed_rejection")
 
         result = await reject_execution(execution_id)
         logger.info("Execution %s rejected", execution_id)
@@ -172,13 +155,10 @@ async def reject_execution_endpoint(execution_id: str) -> dict:
         return {
             "executionId": execution_id,
             "status": "rejected",
-            "detail": result.get("error", "Execution rejected"),
+            "detail": result.get("error", t("execution_rejected")),
         }
     except Exception as e:
         logger.error("Failed to reject execution %s: %s", execution_id, e)
-        raise HTTPException(
-            status_code=500,
-            detail=f"Failed to reject execution: {e}",
-        )
+        raise http_error(500, "reject_failed", error=str(e))
     finally:
         execution_manager._execution_lock.release(execution_id)

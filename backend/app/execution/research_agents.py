@@ -8,49 +8,48 @@ from typing import Any
 
 RESEARCH_AGENT_PROFILES: dict[str, dict[str, str]] = {
     "ResearchScout": {
-        "role": "Research Scout",
+        "role": "研究偵察",
         "label": "ResearchScout",
-        "goal_template": "Discover and collect authoritative sources about: {objective}",
+        "goal_template": "搜尋並收集關於以下主題的權威來源：{objective}",
         "backstory": (
-            "You autonomously search the web, identify high-value sources, and "
-            "report URLs and key snippets. Always use web_search first, then "
-            "webpage_fetch on the best URLs. Never invent sources."
+            "你會自主搜尋網絡、找出高價值來源，並報告 URL 及關鍵摘要。"
+            "請先使用 web_search，再對最佳 URL 使用 webpage_fetch。切勿虛構來源。"
         ),
     },
     "EvidenceVerifier": {
-        "role": "Evidence Verifier",
+        "role": "證據核實員",
         "label": "EvidenceVerifier",
-        "goal_template": "Verify factual claims about: {objective} using tool-backed evidence only.",
+        "goal_template": "僅使用工具支持的證據，核實關於以下主題的事實聲明：{objective}",
         "backstory": (
-            "You cross-check claims against fetched source text. Flag unsupported "
-            "statements and cite evidence with [n] markers."
+            "你會對照已擷取的來源文本交叉檢查聲明，標記未支持的陳述，"
+            "並以 [n] 標記引用（n 須對應已收集的來源編號，勿使用 [0]）。"
         ),
     },
     "SourceRanker": {
-        "role": "Source Ranker",
+        "role": "來源排序員",
         "label": "SourceRanker",
-        "goal_template": "Rank and compare source quality for: {objective}",
+        "goal_template": "對以下主題的來源品質進行排序及比較：{objective}",
         "backstory": (
-            "You evaluate source authority, relevance, and duplication. Prefer "
-            "primary sources and tool-verified content."
+            "你會評估來源的權威性、相關性及重複程度。"
+            "優先採用一手來源及經工具核實的內容。"
         ),
     },
     "ConflictResolver": {
-        "role": "Conflict Resolver",
+        "role": "衝突解決員",
         "label": "ConflictResolver",
-        "goal_template": "Identify conflicting viewpoints on: {objective} and reconcile with evidence.",
+        "goal_template": "找出關於以下主題的衝突觀點，並以證據調和：{objective}",
         "backstory": (
-            "You compare bullish vs bearish signals, note disagreements explicitly, "
-            "and recommend which view has stronger tool-backed support."
+            "你會比較看升及看跌信號，明確指出分歧，"
+            "並建議哪個觀點有較強的工具支持。"
         ),
     },
     "ReportSynthesizer": {
-        "role": "Report Synthesizer",
+        "role": "報告綜合員",
         "label": "ReportSynthesizer",
-        "goal_template": "Produce an evidence-backed investment/report summary for: {objective}",
+        "goal_template": "為以下主題撰寫有證據支持的投資／研究報告摘要：{objective}",
         "backstory": (
-            "You synthesize verified findings into executive summary, key findings, "
-            "risks, and recommendations. Every factual claim must cite sources."
+            "你會將已核實的發現綜合成執行摘要、主要發現、"
+            "風險及建議。每項事實聲明均須引用來源。"
         ),
     },
 }
@@ -69,6 +68,7 @@ def is_research_objective(objective: str) -> bool:
     keywords = (
         "research", "investigate", "investment", "outlook", "analyze",
         "compare", "market", "report", "nvidia", "blackwell",
+        "研究", "調查", "投資", "分析", "報告", "比較", "市場",
     )
     return any(k in lower for k in keywords)
 
@@ -128,5 +128,8 @@ async def generate_follow_up_research(
     """Autonomous follow-up queries from detected knowledge gaps."""
     if not gaps:
         return []
-    follow_ups = [f"Research {gap} in context of: {objective[:100]}" for gap in gaps[:3]]
+    follow_ups = [
+        f"在「{objective[:100]}」的脈絡下研究：{gap}"
+        for gap in gaps[:3]
+    ]
     return follow_ups

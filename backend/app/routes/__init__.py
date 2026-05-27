@@ -19,6 +19,7 @@ from app.routes.cognition import router as cognition_router
 from app.routes.intelligence import router as intelligence_router
 from app.routes.infrastructure import router as infrastructure_router
 from app.routes.self_improvement import router as self_improvement_router
+from app.routes.models import router as models_router
 
 # Master router that collects all sub-routers
 api_router = APIRouter()
@@ -34,6 +35,7 @@ api_router.include_router(cognition_router)
 api_router.include_router(intelligence_router)
 api_router.include_router(infrastructure_router)
 api_router.include_router(self_improvement_router)
+api_router.include_router(models_router)
 
 
 def register_routes(app: "FastAPI") -> None:

@@ -43,8 +43,10 @@ Runtime safety:
 import asyncio
 import json
 import logging
+import re
 import traceback
 import uuid
+from types import SimpleNamespace
 from datetime import datetime, timezone
 from typing import Any
 
@@ -68,6 +70,12 @@ from app.execution.hierarchical_memory import HierarchicalMemory
 from app.execution.memory_runtime import MemoryRuntime
 from app.execution.parallel_runtime import ParallelRuntime
 from app.execution.research_agents import is_research_objective
+from app.config.locale import language_instruction, t
+from app.execution.research_pipeline_state import (
+    is_research_pipeline_ready,
+    pipeline_synthesis_mode_block,
+    research_pipeline_context_block,
+)
 from app.execution.tool_planning import ToolPlanner
 from app.tools.tool_orchestrator import ToolOrchestrator
 from app.execution.execution_runtime import ExecutionRuntime
@@ -77,6 +85,7 @@ from app.tools.tool_invocation import (
     MAX_TOOL_INVOCATIONS,
     ToolInvocationOutcome,
     execute_tool_request_if_present,
+    parse_tool_request,
 )
 from app.tools.tool_models import ToolCallRequest
 from app.tools.tool_registry import tool_registry
@@ -132,52 +141,189 @@ def _format_tool_descriptions() -> str:
     return "\n".join(lines)
 
 
-def _tool_usage_instructions() -> str:
-    return (
-        "IMPORTANT: For factual research, current events, or external data you MUST use tools "
-        "instead of guessing or hallucinating.\n"
+def _tool_usage_instructions(*, skip_web_search: bool = False) -> str:
+    research_flow = (
         "Preferred research flow:\n"
         "  1. web_search with your query to find sources\n"
         "  2. webpage_fetch on relevant URLs to read content\n"
         "  3. structured_data_extractor or markdown_generator to format findings\n\n"
+    )
+    if skip_web_search:
+        research_flow = (
+            "Pre-collected research evidence is already in context above.\n"
+            "Synthesize from that evidence. Only call tools if a specific claim still needs verification.\n\n"
+        )
+    return (
+        "IMPORTANT: For factual research, current events, or external data you MUST use tools "
+        "instead of guessing or hallucinating.\n"
+        f"{research_flow}"
         "To invoke a tool, respond with ONLY a single JSON object:\n"
         '{"tool_name": "<tool_name>", "input_data": { ... }}\n'
         "Do not include markdown or explanation with the tool request.\n"
         "After the tool runs, its output appears in shared context — continue reasoning from that data.\n"
+        "When evidence is sufficient, respond with prose (NOT JSON) as your final answer.\n"
         "Safe tools (calculator, web_search, webpage_fetch, file_reader, etc.) run immediately.\n"
         "Restricted tools (shell_command, file_write, file_delete, http_post) pause for approval.\n"
     )
+
+
+def _final_answer_instructions(*, strict: bool = False) -> str:
+    base = (
+        "--- FINAL STEP ---\n"
+        "Tools have already run and results are in context above.\n"
+        "Write your complete final answer in clear markdown prose with headings "
+        "(Summary, Findings, Recommendations, Next Steps).\n"
+        "Do NOT output JSON, tool requests, or {\"tool_name\": ...} payloads.\n"
+    )
+    if strict:
+        base += (
+            "Your previous response was rejected because it was not valid prose. "
+            "Output markdown only — no code blocks containing JSON.\n"
+        )
+    return base
+
+
+def _pipeline_synthesis_mode_block() -> str:
+    return pipeline_synthesis_mode_block()
+
+
+def _research_pipeline_ready(ctx: ContextManager) -> bool:
+    return is_research_pipeline_ready(ctx)
+
+
+def _research_pipeline_block(ctx: ContextManager) -> str:
+    return research_pipeline_context_block(ctx)
+
+
+def _fallback_research_prose(ctx: ContextManager, goal: str) -> str:
+    """Deterministic prose when the model keeps returning tool JSON."""
+    summary = ctx.get_workflow_memory("research_pipeline_summary") or {}
+    block = str(ctx.get_workflow_memory("research_context_block") or "").strip()
+    return "\n".join([
+        "## Summary",
+        str(summary.get("summary") or "Research pipeline collected evidence for this objective."),
+        "",
+        "## Findings",
+        block[:6000] if block else "See pre-collected source material in execution context.",
+        "",
+        "## Recommendations",
+        "Validate financial projections against primary sources before acting on this research.",
+        "",
+        "## Next Steps",
+        goal[:300] or "Review cited sources and monitor NVIDIA Blackwell adoption metrics.",
+    ])
+
+
+def _needs_prose_finalization(output_text: str, pipeline_ready: bool) -> bool:
+    if parse_tool_request(output_text) is not None:
+        return True
+    if not pipeline_ready:
+        return False
+    words = re.findall(r"\w+", output_text or "")
+    return len(words) < 50
+
+
+async def _finalize_agent_output(
+    *,
+    execution_id: str,
+    agent: Any,
+    node_data: dict[str, Any],
+    output_text: str,
+    combined_context: str,
+    tool_plan_block: str,
+    research_block: str,
+    agent_timeout: int,
+    pipeline_ready: bool,
+    node_id: str,
+    agent_name: str,
+    ctx: ContextManager,
+) -> str:
+    if not _needs_prose_finalization(output_text, pipeline_ready):
+        return output_text
+
+    for attempt in range(2):
+        synthesis_prompt = (
+            _resolve_prompt(
+                node_data, combined_context, tool_plan_block, research_block
+            )
+            + "\n\n"
+            + _pipeline_synthesis_mode_block()
+            + "\n"
+            + _final_answer_instructions(strict=attempt > 0)
+        )
+        task = _build_execution_task(agent, synthesis_prompt)
+        await ExecutionStabilityMonitor.start_agent_monitor(
+            execution_id=execution_id,
+            node_id=node_id,
+            agent_name=agent_name,
+            emit_fn=_emit,
+            cancel_check=execution_manager.is_cancellation_requested,
+        )
+        try:
+            output_text = await _run_agent_with_timeout(
+                execution_id=execution_id,
+                agent=agent,
+                task=task,
+                timeout=agent_timeout,
+            )
+        finally:
+            await ExecutionStabilityMonitor.stop_agent_monitor(execution_id)
+
+        if not _needs_prose_finalization(output_text, pipeline_ready):
+            return output_text
+
+    goal = node_data.get("goal", "")
+    if pipeline_ready:
+        return _fallback_research_prose(ctx, goal)
+    return output_text
 
 
 def _resolve_prompt(
     node_data: dict[str, Any],
     context: str,
     tool_plan_block: str = "",
+    research_block: str = "",
 ) -> str:
     """Build the task prompt for an agent node."""
     goal = node_data.get("goal", "Complete the assigned task.")
     label = node_data.get("label", "Agent")
 
-    parts = [f"You are acting as: {label}", "", f"Your goal: {goal}"]
+    parts = [t("acting_as", label=label), "", t("your_goal", goal=goal)]
+
+    if research_block.strip():
+        parts.extend(["", research_block])
 
     if context.strip():
-        parts.extend(["", "--- Context from previous agents ---", context])
+        parts.extend(["", t("context_from_agents"), context])
 
     if tool_plan_block.strip():
         parts.extend(["", tool_plan_block])
 
-    parts.extend([
-        "",
-        "--- Instructions ---",
-        "Complete your goal using the context provided above.",
-        "Be concise and structured — avoid repetition and filler.",
-        "Use tools for factual claims instead of guessing.",
-        "",
-        "--- Tool Guidance ---",
-        _tool_usage_instructions(),
-        "",
-        _format_tool_descriptions(),
-    ])
+    skip_web_search = bool(research_block.strip())
+    if skip_web_search:
+        parts.extend([
+            "",
+            t("instructions"),
+            _pipeline_synthesis_mode_block(),
+            t("complete_goal_with_evidence"),
+            t("be_concise"),
+            t("respond_markdown_sections"),
+            language_instruction(),
+        ])
+    else:
+        parts.extend([
+            "",
+            t("instructions"),
+            t("complete_goal_with_context"),
+            t("be_concise"),
+            t("use_tools_not_guess"),
+            "",
+            t("tool_guidance"),
+            _tool_usage_instructions(skip_web_search=False),
+            "",
+            _format_tool_descriptions(),
+            language_instruction(),
+        ])
 
     return "\n".join(parts)
 
@@ -223,7 +369,7 @@ async def _maybe_execute_agent_tool_call(
             execution_id,
             "tool_completed",
             agent_name,
-            f"Tool {response.tool_name} completed successfully.",
+            t("tool_completed", name=response.tool_name),
             toolName=response.tool_name,
             toolOutput=response.output,
         )
@@ -280,6 +426,22 @@ async def _maybe_execute_agent_tool_call(
 
 
 # ── Streaming event helpers ───────────────────────────────────────────
+
+
+def _build_execution_task(agent: Any, prompt: str) -> Any:
+    """
+    Build a task object compatible with the underlying agent implementation.
+
+    CrewAI agents require CrewTask validation; provider adapters only need a
+    description field.
+    """
+    if agent.__class__.__module__.startswith("crewai"):
+        return CrewTask(
+            description=prompt,
+            expected_output="A concise, well-structured response addressing the goal.",
+            agent=agent,
+        )
+    return SimpleNamespace(description=prompt)
 
 
 async def _emit(
@@ -637,7 +799,7 @@ async def _execute_agent_step(
         execution_id,
         "agent_started",
         agent_name,
-        f"[{idx}/{agent_count}] Activating {agent_name}...",
+        t("activating_agent", idx=idx, total=agent_count, name=agent_name),
         nodeId=node_id,
         step=idx,
         totalSteps=agent_count,
@@ -649,7 +811,7 @@ async def _execute_agent_step(
         "timestamp": step_now,
         "level": "info",
         "agentName": "system",
-        "content": f"[{idx}/{agent_count}] Activating {agent_name}...",
+        "content": t("activating_agent", idx=idx, total=agent_count, name=agent_name),
     }
     logs.append(log_entry)
 
@@ -658,7 +820,7 @@ async def _execute_agent_step(
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "level": "agent",
         "agentName": agent_name,
-        "content": f"Starting task: {node_data.get('goal', 'No goal specified')}",
+        "content": t("starting_task", goal=node_data.get("goal", t("no_goal"))),
     }
     logs.append(log_entry2)
 
@@ -666,7 +828,7 @@ async def _execute_agent_step(
         execution_id,
         "log",
         agent_name,
-        f"Starting task: {node_data.get('goal', 'No goal specified')}",
+        t("starting_task", goal=node_data.get("goal", t("no_goal"))),
         logId=log_entry2["id"],
         level="agent",
     )
@@ -700,6 +862,8 @@ async def _execute_agent_step(
         tool_plan = ToolPlanner.infer_tools_for_node(node)
         ToolPlanner.persist_plan(ctx, tool_plan)
         tool_plan_block = ToolPlanner.build_tool_context_block(tool_plan)
+        pipeline_ready = _research_pipeline_ready(ctx)
+        research_block = _research_pipeline_block(ctx)
         if ConfidenceEngine.should_force_tool_grounding(ctx):
             tool_plan_block += (
                 "\n\nLOW CONFIDENCE: Use web_search and webpage_fetch to ground "
@@ -722,7 +886,7 @@ async def _execute_agent_step(
             execution_id,
             "context_budget",
             agent_name,
-            f"Context budget: ~{budget_meta.get('estimatedTokens', 0)} tokens",
+            t("context_budget", tokens=budget_meta.get("estimatedTokens", 0)),
             nodeId=node_id,
             **{k: v for k, v in budget_meta.items() if isinstance(v, (str, int, float, bool, list))},
         )
@@ -740,20 +904,18 @@ async def _execute_agent_step(
             total_nodes=agent_count,
             emit_fn=_emit,
         )
-        prompt = _resolve_prompt(node_data, combined_context, tool_plan_block)
-
-        task = CrewTask(
-            description=prompt,
-            expected_output="A concise, well-structured response addressing the goal.",
-            agent=agent,
+        prompt = _resolve_prompt(
+            node_data, combined_context, tool_plan_block, research_block
         )
+
+        task = _build_execution_task(agent, prompt)
 
         # Emit: thinking
         await _emit(
             execution_id,
             "thinking",
             agent_name,
-            f"⏳ {agent_name} is thinking...",
+            t("agent_thinking", name=agent_name),
             nodeId=node_id,
             plannedTools=tool_plan.recommended_tools,
         )
@@ -782,88 +944,115 @@ async def _execute_agent_step(
 
         RuntimePerformanceTracker.end_stage(execution_id, "agent", agent_name)
 
-        # Allow the agent to request structured tool invocations and continue.
-        for attempt in range(MAX_TOOL_INVOCATIONS):
-            outcome = await _maybe_execute_agent_tool_call(
-                execution_id=execution_id,
-                node_id=node_id,
-                agent_name=agent_name,
-                output_text=output_text,
-                ctx=ctx,
-            )
-
-            if outcome is None:
-                break
-
-            if outcome.response.status == "completed":
-                ctx.set_workflow_memory(
-                    "last_tool_result",
-                    {
-                        "tool_name": outcome.response.tool_name,
-                        "output": outcome.response.output,
-                    },
-                )
-                await ctx.persist()
-
-                memory_runtime = MemoryRuntime.for_execution(execution_id, ctx)
-                assembly = await memory_runtime.assemble_context(
-                    model_tier=model_tier,
-                    is_synthesis=is_synthesis,
-                    is_retry=is_retry,
-                    agent_name=agent_name,
-                    agent_role=node_data.get("role", ""),
-                    emit_fn=_emit,
-                )
-                combined_context = assembly.context
-                prompt = _resolve_prompt(node_data, combined_context, tool_plan_block)
-                task = CrewTask(
-                    description=prompt,
-                    expected_output="A concise, well-structured response addressing the goal.",
-                    agent=agent,
-                )
-                await ExecutionStabilityMonitor.start_agent_monitor(
+        # When pipeline evidence exists, skip agent tool loops entirely.
+        if not pipeline_ready:
+            last_tool_key: tuple[str, str] | None = None
+            for attempt in range(MAX_TOOL_INVOCATIONS):
+                outcome = await _maybe_execute_agent_tool_call(
                     execution_id=execution_id,
                     node_id=node_id,
                     agent_name=agent_name,
-                    emit_fn=_emit,
-                    cancel_check=execution_manager.is_cancellation_requested,
+                    output_text=output_text,
+                    ctx=ctx,
                 )
-                try:
-                    output_text = await _run_agent_with_timeout(
-                        execution_id=execution_id,
-                        agent=agent,
-                        task=task,
-                        timeout=agent_timeout,
+
+                if outcome is None:
+                    break
+
+                if outcome.response.status == "completed":
+                    tool_key = (
+                        outcome.request.tool_name,
+                        json.dumps(
+                            outcome.request.input_data,
+                            sort_keys=True,
+                            ensure_ascii=False,
+                        ),
                     )
-                finally:
-                    await ExecutionStabilityMonitor.stop_agent_monitor(execution_id)
-                continue
+                    if tool_key == last_tool_key:
+                        break
+                    last_tool_key = tool_key
 
-            if outcome.response.status == "pending_approval":
-                failed_now = datetime.now(timezone.utc).isoformat()
-                await db.execute(
-                    """UPDATE execution_steps
-                       SET status = 'failed', output = ?, completed_at = ?
-                       WHERE id = ?""",
-                    (
-                        f"Tool approval required for {outcome.response.tool_name}",
-                        failed_now,
-                        step_id,
-                    ),
-                )
-                await db.commit()
-                return "failed", outcome.response.error or "Tool approval required"
+                    ctx.set_workflow_memory(
+                        "last_tool_result",
+                        {
+                            "tool_name": outcome.response.tool_name,
+                            "output": outcome.response.output,
+                        },
+                    )
+                    await ctx.persist()
 
-            if outcome.response.status == "failed":
-                failed_now = datetime.now(timezone.utc).isoformat()
-                await db.execute(
-                    """UPDATE execution_steps
-                       SET status = 'failed', output = ?, completed_at = ?
-                       WHERE id = ?""",
-                    (outcome.response.error or "Tool failed", failed_now, step_id),
-                )
-                await db.commit()
-                return "failed", outcome.response.error or "Tool failed"
+                    memory_runtime = MemoryRuntime.for_execution(execution_id, ctx)
+                    assembly = await memory_runtime.assemble_context(
+                        model_tier=model_tier,
+                        is_synthesis=is_synthesis,
+                        is_retry=is_retry,
+                        agent_name=agent_name,
+                        agent_role=node_data.get("role", ""),
+                        emit_fn=_emit,
+                    )
+                    combined_context = assembly.context
+                    prompt = _resolve_prompt(
+                        node_data, combined_context, tool_plan_block, research_block
+                    )
+                    task = _build_execution_task(agent, prompt)
+                    await ExecutionStabilityMonitor.start_agent_monitor(
+                        execution_id=execution_id,
+                        node_id=node_id,
+                        agent_name=agent_name,
+                        emit_fn=_emit,
+                        cancel_check=execution_manager.is_cancellation_requested,
+                    )
+                    try:
+                        output_text = await _run_agent_with_timeout(
+                            execution_id=execution_id,
+                            agent=agent,
+                            task=task,
+                            timeout=agent_timeout,
+                        )
+                    finally:
+                        await ExecutionStabilityMonitor.stop_agent_monitor(execution_id)
+                    continue
+
+                if outcome.response.status == "pending_approval":
+                    failed_now = datetime.now(timezone.utc).isoformat()
+                    await db.execute(
+                        """UPDATE execution_steps
+                           SET status = 'failed', output = ?, completed_at = ?
+                           WHERE id = ?""",
+                        (
+                            f"Tool approval required for {outcome.response.tool_name}",
+                            failed_now,
+                            step_id,
+                        ),
+                    )
+                    await db.commit()
+                    return "failed", outcome.response.error or "Tool approval required"
+
+                if outcome.response.status == "failed":
+                    failed_now = datetime.now(timezone.utc).isoformat()
+                    await db.execute(
+                        """UPDATE execution_steps
+                           SET status = 'failed', output = ?, completed_at = ?
+                           WHERE id = ?""",
+                        (outcome.response.error or "Tool failed", failed_now, step_id),
+                    )
+                    await db.commit()
+                    return "failed", outcome.response.error or "Tool failed"
+
+        output_text = await _finalize_agent_output(
+            execution_id=execution_id,
+            agent=agent,
+            node_data=node_data,
+            output_text=output_text,
+            combined_context=combined_context,
+            tool_plan_block=tool_plan_block,
+            research_block=research_block,
+            agent_timeout=agent_timeout,
+            pipeline_ready=pipeline_ready,
+            node_id=node_id,
+            agent_name=agent_name,
+            ctx=ctx,
+        )
 
         completed_now = datetime.now(timezone.utc).isoformat()
         ctx.add_output(node_id, agent_name, output_text)
@@ -916,7 +1105,7 @@ async def _execute_agent_step(
             execution_id,
             "agent_completed",
             agent_name,
-            f"✓ {agent_name} completed",
+            t("agent_completed", name=agent_name),
             nodeId=node_id,
             duration=(
                 datetime.now(timezone.utc)
@@ -929,7 +1118,7 @@ async def _execute_agent_step(
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "level": "info",
             "agentName": "system",
-            "content": f"✓ {agent_name} completed",
+            "content": t("agent_completed", name=agent_name),
         }
         logs.append(log_entry5)
 
@@ -937,7 +1126,7 @@ async def _execute_agent_step(
             execution_id,
             "log",
             "system",
-            f"✓ {agent_name} completed",
+            t("agent_completed", name=agent_name),
             logId=log_entry5["id"],
             level="info",
         )
@@ -1076,7 +1265,7 @@ async def _emit_confidence(
         execution_id,
         "confidence_updated",
         assessment.agent_name,
-        f"Confidence {assessment.score:.0%}: {assessment.reasoning}",
+        t("confidence", score=f"{assessment.score:.0%}", reasoning=assessment.reasoning),
         nodeId=assessment.node_id,
         confidenceScore=assessment.score,
         triggers=assessment.triggers,
@@ -1579,7 +1768,7 @@ async def execute_workflow(
         execution_id,
         "workflow_started",
         "system",
-        f"Starting workflow: {workflow_name} ({agent_count} nodes)",
+        t("starting_workflow", name=workflow_name, count=agent_count),
         workflowId=workflow_id,
         workflowName=workflow_name,
         agentCount=agent_count,
@@ -1590,7 +1779,7 @@ async def execute_workflow(
         "timestamp": now,
         "level": "info",
         "agentName": "system",
-        "content": f"Starting workflow: {workflow_name} ({agent_count} nodes)",
+        "content": t("starting_workflow", name=workflow_name, count=agent_count),
     })
 
     # Adaptive DAG execution (parallel batches + runtime replanning)
@@ -1631,7 +1820,7 @@ async def execute_workflow(
         await _record_runtime_state(
             execution_id=execution_id,
             to_state=RuntimeState.COMPLETED,
-            reason="Workflow completed successfully",
+            reason=t("workflow_completed_reason"),
             metadata={"workflowName": workflow_name},
             phase=ExecutionPhase.COMPLETED,
         )
@@ -1644,7 +1833,7 @@ async def execute_workflow(
                 execution_id,
                 "synthesis_started",
                 "system",
-                "Synthesizing final report from agent outputs...",
+                t("synthesizing"),
             )
             RuntimePerformanceTracker.begin_stage(execution_id, "synthesis", "system")
             synthesis = FinalResponseSynthesizer.synthesize(
@@ -1660,7 +1849,7 @@ async def execute_workflow(
                     execution_id,
                     "synthesis_conflict_detected",
                     "system",
-                    f"Resolved {len(synthesis.conflicts)} conflicting perspective(s)",
+                    t("synthesis_conflicts", count=len(synthesis.conflicts)),
                     conflicts=synthesis.conflicts,
                     evidenceRanked=synthesis.evidence_ranked,
                 )
@@ -1687,7 +1876,7 @@ async def execute_workflow(
                 execution_id,
                 "synthesis_completed",
                 "system",
-                "Final report ready",
+                t("final_report_ready"),
                 synthesizedOutput=synthesized_markdown,
                 executiveSummary=synthesized_summary,
                 actionableAnswer=synthesis.actionable_answer,
@@ -1706,7 +1895,7 @@ async def execute_workflow(
             "timestamp": completed_now,
             "level": "info",
             "agentName": "system",
-            "content": f"✓ Workflow '{workflow_name}' completed successfully",
+            "content": t("workflow_completed", name=workflow_name),
         }
         logs.append(completion_log)
 
@@ -1714,7 +1903,7 @@ async def execute_workflow(
             execution_id,
             "log",
             "system",
-            f"✓ Workflow '{workflow_name}' completed successfully",
+            t("workflow_completed", name=workflow_name),
             logId=completion_log["id"],
             level="info",
         )
@@ -1723,7 +1912,7 @@ async def execute_workflow(
             execution_id,
             "workflow_completed",
             "system",
-            f"✓ Workflow '{workflow_name}' completed successfully",
+            t("workflow_completed", name=workflow_name),
             executionId=execution_id,
             totalAgents=agent_count,
             duration=(
@@ -2104,7 +2293,7 @@ async def resume_workflow(
         await _record_runtime_state(
             execution_id=execution_id,
             to_state=RuntimeState.COMPLETED,
-            reason="Workflow completed successfully",
+            reason=t("workflow_completed_reason"),
             metadata={"workflowName": workflow_name},
         )
 
@@ -2115,7 +2304,7 @@ async def resume_workflow(
                 execution_id,
                 "synthesis_started",
                 "system",
-                "Synthesizing final report from agent outputs...",
+                t("synthesizing"),
             )
             RuntimePerformanceTracker.begin_stage(execution_id, "synthesis", "system")
             synthesis = FinalResponseSynthesizer.synthesize(
@@ -2131,7 +2320,7 @@ async def resume_workflow(
                     execution_id,
                     "synthesis_conflict_detected",
                     "system",
-                    f"Resolved {len(synthesis.conflicts)} conflicting perspective(s)",
+                    t("synthesis_conflicts", count=len(synthesis.conflicts)),
                     conflicts=synthesis.conflicts,
                     evidenceRanked=synthesis.evidence_ranked,
                 )
@@ -2158,7 +2347,7 @@ async def resume_workflow(
                 execution_id,
                 "synthesis_completed",
                 "system",
-                "Final report ready",
+                t("final_report_ready"),
                 synthesizedOutput=synthesized_markdown,
                 executiveSummary=synthesized_summary,
                 actionableAnswer=synthesis.actionable_answer,
@@ -2176,7 +2365,7 @@ async def resume_workflow(
             execution_id,
             "workflow_completed",
             "system",
-            f"✓ Workflow '{workflow_name}' completed successfully",
+            t("workflow_completed", name=workflow_name),
             executionId=execution_id,
             totalAgents=agent_count,
             duration=0,

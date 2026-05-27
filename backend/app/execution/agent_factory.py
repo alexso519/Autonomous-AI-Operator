@@ -20,47 +20,42 @@ from crewai import Agent as CrewAgent
 from langchain_community.chat_models import ChatOllama
 
 from app.config.settings import settings
+from app.config.locale import language_instruction, t
+from app.execution.model_preferences import get_model_preference_store
+from app.execution.tongyi_agent import TongyiAgentAdapter
 
 logger = logging.getLogger(__name__)
 
 
-# ── Default backstories per role prefix ─────────────────────────
-# If a node has no backstory, we generate one from its role name.
-_DEFAULT_BACKSTORIES: dict[str, str] = {
-    "researcher": (
-        "You are a meticulous research analyst. "
-        "You gather facts, verify sources, and present evidence-based findings."
-    ),
-    "writer": (
-        "You are a skilled content strategist. "
-        "You transform raw information into clear, compelling narratives."
-    ),
-    "reviewer": (
-        "You are a thorough quality assurance lead. "
-        "You catch inconsistencies, validate logic, and ensure high standards."
-    ),
-    "planner": (
-        "You are an organised project coordinator. "
-        "You break complex goals into structured, actionable steps."
-    ),
-    "coder": (
-        "You are an experienced software engineer. "
-        "You write clean, documented, correct code."
-    ),
-    "analyst": (
-        "You are a data-driven analyst. "
-        "You extract patterns, identify trends, and produce actionable insights."
-    ),
+_DEFAULT_BACKSTORIES_ZH: dict[str, str] = {
+    "researcher": "backstory_researcher",
+    "writer": "backstory_writer",
+    "reviewer": "backstory_reviewer",
+    "planner": "backstory_planner",
+    "coder": "backstory_coder",
+    "analyst": "backstory_analyst",
+}
+
+_DEFAULT_BACKSTORIES_EN: dict[str, str] = {
+    "researcher": "backstory_researcher",
+    "writer": "backstory_writer",
+    "reviewer": "backstory_reviewer",
+    "planner": "backstory_planner",
+    "coder": "backstory_coder",
+    "analyst": "backstory_analyst",
 }
 
 
 def _infer_backstory(role: str, goal: str) -> str:
     """Generate a default backstory from the role name if none provided."""
+    from app.config.locale import is_zh_hk
+
     role_lower = role.lower()
-    for key, story in _DEFAULT_BACKSTORIES.items():
+    mapping = _DEFAULT_BACKSTORIES_ZH if is_zh_hk() else _DEFAULT_BACKSTORIES_EN
+    for key, story_key in mapping.items():
         if key in role_lower:
-            return story
-    return f"You are a {role}. Your goal is: {goal}"
+            return t(story_key)
+    return t("backstory_default", role=role, goal=goal)
 
 
 def build_llm(model_override: str | None = None) -> ChatOllama:
@@ -91,8 +86,73 @@ async def build_agent_routed(
     node_index: int = 1,
     total_nodes: int = 1,
     emit_fn: Any = None,
-) -> tuple[CrewAgent, str]:
+) -> tuple[Any, str]:
     """Build agent with adaptive model routing."""
+    store = get_model_preference_store()
+    current_cfg = store.get()
+    selected_provider = (
+        str(node_data.get("forcedProvider")).strip().lower()
+        if node_data.get("forcedProvider") is not None
+        else current_cfg.provider
+    )
+
+    if selected_provider == "tongyi":
+        selected_model = (
+            str(node_data.get("forcedModel")).strip()
+            if node_data.get("forcedModel")
+            else current_cfg.model
+        )
+        selected_temperature = float(node_data.get("temperature", current_cfg.temperature))
+        selected_max_tokens = int(node_data.get("maxTokens", current_cfg.max_tokens))
+        api_key = current_cfg.api_key.strip()
+        if not api_key:
+            raise RuntimeError(t("api_key_missing_error"))
+        if emit_fn and execution_id:
+            await emit_fn(
+                execution_id,
+                "model_selected",
+                agent_name,
+                t("model_selected_tongyi", model=selected_model),
+                nodeId=node_id,
+                model=selected_model,
+                tier="tongyi",
+                reasons=["provider_tongyi_selected"],
+            )
+        role = node_data.get("role", "Assistant")
+        goal = node_data.get("goal", "Complete the assigned task.")
+        backstory = node_data.get("backstory") or _infer_backstory(role, goal)
+        backstory = f"{backstory}\n\n{language_instruction()}"
+        return (
+            TongyiAgentAdapter(
+                api_key=api_key,
+                model=selected_model,
+                role=role,
+                goal=goal,
+                backstory=backstory,
+                temperature=selected_temperature,
+                max_tokens=selected_max_tokens,
+                base_url=current_cfg.base_url,
+            ),
+            selected_model,
+        )
+
+    forced_model = node_data.get("forcedModel")
+    if isinstance(forced_model, str) and forced_model.strip():
+        selected = forced_model.strip()
+        if emit_fn and execution_id:
+            await emit_fn(
+                execution_id,
+                "model_selected",
+                agent_name,
+                t("model_forced", model=selected),
+                nodeId=node_id,
+                model=selected,
+                tier="manual_override",
+                reasons=["frontend_model_override"],
+            )
+        enriched = {**node_data, "model": selected}
+        return build_agent(enriched), selected
+
     from app.execution.model_router import ModelRouter, RoutingContext
 
     routing_ctx = RoutingContext(
@@ -130,9 +190,10 @@ def build_agent(node_data: dict[str, Any]) -> CrewAgent:
 
     Returns a ready-to-use CrewAI Agent.
     """
-    role = node_data.get("role", "Assistant")
-    goal = node_data.get("goal", "Complete the assigned task.")
+    role = node_data.get("role", t("default_role"))
+    goal = node_data.get("goal", t("default_task"))
     backstory = node_data.get("backstory") or _infer_backstory(role, goal)
+    backstory = f"{backstory}\n\n{language_instruction()}"
     temperature = node_data.get("temperature", 0.7)
     model_override = node_data.get("model")
     label = node_data.get("label", role)

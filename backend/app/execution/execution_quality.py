@@ -17,6 +17,8 @@ from typing import Any
 
 from app.execution.context_manager import ContextManager
 from app.execution.hallucination_guard import HallucinationGuard
+from app.execution.research_pipeline_state import is_research_pipeline_ready
+from app.tools.tool_invocation import parse_tool_request
 
 logger = logging.getLogger(__name__)
 
@@ -83,7 +85,11 @@ class ExecutionQualityScorer:
         re.IGNORECASE,
     )
     FAILURE_PATTERN = re.compile(
-        r"\b(i can(?:'t|not)|cannot|can not|unable to|no output|nothing to report|error|failed|unable)\b",
+        r"\b("
+        r"i can(?:'t|not)|i am unable|i'm unable|cannot complete|can not complete|"
+        r"unable to complete|unable to (?:provide|deliver|answer|proceed)|"
+        r"no output|nothing to report|task failed|execution failed"
+        r")\b",
         re.IGNORECASE,
     )
     STALLED_PATTERN = re.compile(
@@ -106,6 +112,10 @@ class ExecutionQualityScorer:
         "summary", "recommendation", "next steps", "action items",
         "conclusion", "findings", "analysis", "plan", "roadmap",
     ]
+    # Verification/ranking agents should not be scored as full report writers.
+    VERIFICATION_ROLES = frozenset({
+        "EvidenceVerifier", "SourceRanker", "ResearchScout",
+    })
 
     @classmethod
     def score_output(
@@ -135,6 +145,8 @@ class ExecutionQualityScorer:
             or []
         )
         is_research_task = bool(cls.RESEARCH_GOAL_PATTERN.search(goal_lower))
+        has_pipeline_evidence = is_research_pipeline_ready(ctx)
+        is_tool_request_output = parse_tool_request(output) is not None
 
         # ── Factuality confidence ─────────────────────────────────
         factuality_reasons: list[str] = []
@@ -154,12 +166,15 @@ class ExecutionQualityScorer:
                     t for t in tool_calls
                     if t.get("node_id") == node_id and t.get("status") == "completed"
                 ]
-                if not node_tools:
-                    factuality -= 0.35
-                    factuality_reasons.append("research_without_tool_evidence")
-                else:
+                if node_tools:
                     factuality += 0.1
                     factuality_reasons.append("tool_evidence_present")
+                elif has_pipeline_evidence:
+                    factuality += 0.05
+                    factuality_reasons.append("pipeline_evidence_present")
+                else:
+                    factuality -= 0.35
+                    factuality_reasons.append("research_without_tool_evidence")
             if "http://" in output_lower or "https://" in output_lower:
                 factuality += 0.05
                 factuality_reasons.append("contains_references")
@@ -168,18 +183,28 @@ class ExecutionQualityScorer:
         # ── Completion confidence ─────────────────────────────────
         completion_reasons: list[str] = []
         completion = 0.9
-        if word_count < cls.LOW_QUALITY_WORDS:
+        min_words = cls.MIN_OUTPUT_WORDS
+        if has_pipeline_evidence and is_research_task:
+            min_words = 40
+        if is_tool_request_output:
+            completion = 0.1
+            completion_reasons.append("tool_request_not_final_answer")
+        elif word_count < cls.LOW_QUALITY_WORDS:
             completion = 0.2
             completion_reasons.append("very_short_output")
-        elif word_count < cls.MIN_OUTPUT_WORDS:
+        elif word_count < min_words:
             completion = 0.45
             completion_reasons.append("below_minimum_length")
-        if output_lower.endswith(("...", "…", "to be continued")):
-            completion -= 0.3
-            completion_reasons.append("incomplete_ending")
-        if cls._expects_structure(goal_lower) and not cls._has_structure(output_lower):
+        if (
+            not is_tool_request_output
+            and cls._expects_structure(goal_lower, node_data)
+            and not cls._has_structure(output_lower)
+        ):
             completion -= 0.25
             completion_reasons.append("missing_expected_sections")
+        if not is_tool_request_output and output_lower.endswith(("...", "…", "to be continued")):
+            completion -= 0.3
+            completion_reasons.append("incomplete_ending")
         if cls.FAILURE_PATTERN.search(output_lower):
             completion = min(completion, 0.15)
             completion_reasons.append("explicit_failure_language")
@@ -220,6 +245,7 @@ class ExecutionQualityScorer:
             goal=goal,
             tool_calls=[t for t in tool_calls if t.get("node_id") == node_id],
             is_research=is_research_task,
+            pipeline_grounded=has_pipeline_evidence,
         )
         if guard.hallucination_risk > hallucination:
             hallucination = guard.hallucination_risk
@@ -239,12 +265,19 @@ class ExecutionQualityScorer:
                 tool_quality = 0.95
                 tool_reasons.append("used_planned_tools")
             elif is_research_task:
-                tool_quality = 0.25
-                tool_reasons.append("ignored_planned_research_tools")
+                if has_pipeline_evidence:
+                    tool_quality = 0.9
+                    tool_reasons.append("pipeline_evidence_sufficient")
+                else:
+                    tool_quality = 0.25
+                    tool_reasons.append("ignored_planned_research_tools")
         elif is_research_task:
             if node_tool_calls:
                 tool_quality = 0.85
                 tool_reasons.append("research_tools_used")
+            elif has_pipeline_evidence:
+                tool_quality = 0.85
+                tool_reasons.append("pipeline_evidence_used")
             else:
                 tool_quality = 0.2
                 tool_reasons.append("research_task_no_tools")
@@ -311,6 +344,29 @@ class ExecutionQualityScorer:
                 "unsupported_claims",
             }
         )
+        completed_node_tools = [
+            t for t in node_tool_calls if t.get("status") == "completed"
+        ]
+        if (
+            should_retry
+            and issues == ["incomplete_output"]
+            and overall >= 0.70
+            and (completed_node_tools or has_pipeline_evidence)
+        ):
+            should_retry = False
+
+        pipeline_tool_issues = {
+            "low_factuality", "hallucination_risk", "poor_tool_usage", "unsupported_claims",
+        }
+        if (
+            should_retry
+            and has_pipeline_evidence
+            and is_research_task
+            and word_count >= 60
+            and not is_tool_request_output
+            and set(issues) <= pipeline_tool_issues
+        ):
+            should_retry = False
 
         all_reasons = sorted(
             {r for d in dimensions.values() for r in d.reasons}
@@ -411,7 +467,12 @@ class ExecutionQualityScorer:
         return max_ratio
 
     @classmethod
-    def _expects_structure(cls, goal_lower: str) -> bool:
+    def _expects_structure(cls, goal_lower: str, node_data: dict[str, Any] | None = None) -> bool:
+        if node_data:
+            label = node_data.get("label", "")
+            research_agent = (node_data.get("executionMetadata") or {}).get("researchAgent", "")
+            if label in cls.VERIFICATION_ROLES or research_agent in cls.VERIFICATION_ROLES:
+                return False
         return any(kw in goal_lower for kw in [
             "plan", "strategy", "analysis", "report", "recommend", "summary", "review",
         ])

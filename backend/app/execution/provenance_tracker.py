@@ -8,6 +8,7 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable
 
+from app.config.locale import t
 from app.execution.context_manager import ContextManager
 from app.execution.evidence_graph import EvidenceGraph
 
@@ -108,7 +109,7 @@ class ProvenanceTracker:
             execution_id,
             "provenance_linked",
             "system",
-            f"Linked fact to {record.tool_name}: {record.fact[:80]}",
+            t("provenance_linked", tool=record.tool_name, fact=record.fact[:80]),
             provenanceId=record.id,
             toolName=record.tool_name,
             sourceId=record.source_id,

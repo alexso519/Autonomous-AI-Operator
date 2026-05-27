@@ -19,8 +19,13 @@ services:
       - backend_data:/app/data
     environment:
       - OLLAMA_URL=http://ollama:11434
+      - LLM_PROVIDER=tongyi
+      - DEFAULT_MODEL=qwen-turbo
+      - TONGYI_API_KEY=sk-2c82baff516a4ff38a0b786b42f8e0db
+      - TONGYI_BASE_URL=https://dashscope-intl.aliyuncs.com/compatible-mode/v1
       - DATABASE_PATH=/app/data/workflows.db
       - PYTHONDONTWRITEBYTECODE=1
+      - APP_LOCALE=zh_HK
     depends_on:
       - ollama
     networks:

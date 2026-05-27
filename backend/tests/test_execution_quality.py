@@ -43,6 +43,7 @@ sys.modules["app.execution.retry_policy"] = rp_mod
 rp_spec.loader.exec_module(rp_mod)
 RetryPolicy = rp_mod.RetryPolicy
 RetryType = rp_mod.RetryType
+ExecutionQualityScore = eq_mod.ExecutionQualityScore
 
 
 def test_quality_scores_low_output():
@@ -90,6 +91,59 @@ def test_retry_budget_enforcement():
     can, reason = RetryPolicy.can_retry(ctx, "agent-0")
     assert not can
     assert "budget" in reason
+
+
+def test_evidence_verifier_not_scored_as_full_report():
+    """Verification agents should not fail for missing report sections."""
+    ctx = ContextManager()
+    ctx.set_workflow_memory("research_pipeline_completed", True)
+    ctx.set_workflow_memory("tool_calls", [{"node_id": "pipeline", "status": "completed", "tool_name": "web_search"}])
+    output = (
+        "# Verification Summary\n\n"
+        "NVIDIA Blackwell delivers strong inference economics per [1] and [2]. "
+        "Fiscal 2026 revenue growth aligns with official architecture claims [1]. "
+        "Supply constraints noted in secondary sources remain unverified."
+    ) * 2
+    ctx.add_output("agent-1", "EvidenceVerifier", output)
+    node = {
+        "id": "agent-1",
+        "data": {
+            "label": "EvidenceVerifier",
+            "goal": (
+                "Verify factual claims about: Research NVIDIA Blackwell and generate "
+                "an investment summary using tool-backed evidence only."
+            ),
+            "executionMetadata": {"researchAgent": "EvidenceVerifier"},
+        },
+    }
+    score = ExecutionQualityScorer.score_output(node, ctx)
+    assert "incomplete_output" not in score.issues
+    assert not score.should_retry
+
+
+def test_expand_retry_uses_human_readable_hints():
+    quality = ExecutionQualityScore(
+        node_id="n1",
+        agent_name="EvidenceVerifier",
+        overall_score=0.6,
+        factuality_confidence=0.7,
+        completion_confidence=0.4,
+        repetition_score=0.0,
+        hallucination_risk=0.2,
+        tool_usage_quality=0.8,
+        output_usefulness=0.5,
+        dimensions={},
+        reasons=[],
+        issues=["incomplete_output", "explicit_failure"],
+        should_retry=True,
+        retry_hints=["clarify_goal_and_retry", "expand_with_missing_sections", "use_tools_for_facts"],
+    )
+    suffix, _, _ = RetryPolicy._build_strategy(
+        RetryType.EXPAND, quality, "prior output", "abc", []
+    )
+    assert "clarify_goal_and_retry" not in suffix
+    assert "Summary, Findings, Recommendations" in suffix
+    assert "tool-verified facts" in suffix
 
 
 if __name__ == "__main__":

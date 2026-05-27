@@ -26,9 +26,11 @@ from typing import Any
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
+from app.config.locale import t
 from app.database.database import get_db
 from app.execution.manager import execution_manager
 from app.execution.autonomous_service import get_autonomous_service
+from app.execution.model_preferences import get_model_preference_store
 from app.planning import get_planner
 from app.services.task_analyzer import get_analyzer
 
@@ -68,6 +70,12 @@ class ExecuteRequest(BaseModel):
 
     workflow_name: str | None = Field(None, max_length=200)
     """Optional custom workflow name (auto-generated if not provided)"""
+    llm_config: dict[str, Any] | None = Field(
+        default=None,
+        alias="model_config",
+        serialization_alias="model_config",
+    )
+    """Optional runtime model override for this execution."""
 
 
 class ExecuteResponse(BaseModel):
@@ -118,7 +126,7 @@ async def analyze_task(req: AnalyzeRequest) -> AnalyzeResponse:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         logger.error("Task analysis failed: %s", e)
-        raise HTTPException(status_code=500, detail=f"Analysis failed: {e}")
+        raise HTTPException(status_code=500, detail=t("analysis_failed", error=str(e)))
 
 
 @router.post("/execute")
@@ -151,6 +159,26 @@ async def execute_task_autonomous(req: ExecuteRequest) -> ExecuteResponse:
         HTTPException 500 if execution fails to start
     """
     try:
+        store = get_model_preference_store()
+        provider = (
+            str(req.llm_config.get("provider")).strip().lower()
+            if req.llm_config and req.llm_config.get("provider") is not None
+            else store.get().provider
+        )
+        if provider not in set(store.get_options()["providers"]):
+            raise HTTPException(status_code=400, detail=t("provider_not_allowed"))
+        if provider == "tongyi" and not store.get().api_key:
+            raise HTTPException(status_code=400, detail=t("api_key_not_configured"))
+
+        if req.llm_config:
+            allowed_models = set(store.get_options()["models"])
+            model = req.llm_config.get("model")
+            if model and model not in allowed_models:
+                raise HTTPException(status_code=400, detail=t("model_not_allowed"))
+            temperature = req.llm_config.get("temperature")
+            if temperature is not None and (not isinstance(temperature, (int, float)) or temperature < 0 or temperature > 2):
+                raise HTTPException(status_code=400, detail=t("temperature_range"))
+
         # 1. Analyze the task
         analyzer = get_analyzer()
         analysis = await analyzer.analyze(req.objective)
@@ -164,7 +192,11 @@ async def execute_task_autonomous(req: ExecuteRequest) -> ExecuteResponse:
 
         # Delegate orchestration to the AutonomousExecutionService
         service = get_autonomous_service()
-        result = await service.start(req.objective, req.workflow_name)
+        result = await service.start(
+            req.objective,
+            req.workflow_name,
+            model_config=req.llm_config,
+        )
 
         return ExecuteResponse(
             executionId=result["executionId"],
@@ -180,7 +212,7 @@ async def execute_task_autonomous(req: ExecuteRequest) -> ExecuteResponse:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         logger.error("Autonomous execution failed to start: %s", e, exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Execution failed: {e}")
+        raise HTTPException(status_code=500, detail=t("execution_failed", error=str(e)))
 
 
 # ── Health check ──────────────────────────────────────────────

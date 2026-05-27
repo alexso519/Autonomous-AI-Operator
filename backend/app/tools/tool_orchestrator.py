@@ -12,6 +12,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable
 
+from app.config.locale import t
 from app.execution.context_manager import ContextManager
 from app.execution.evidence_graph import EvidenceGraph
 from app.execution.provenance_tracker import ProvenanceTracker
@@ -194,7 +195,7 @@ class ToolOrchestrator:
             execution_id,
             "tool_chain_started",
             agent_name,
-            f"Starting research tool chain: {plan.name}",
+            t("research_chain_started", name=plan.name),
             chainId=plan.chain_id,
             chainName=plan.name,
             steps=[s.to_dict() for s in plan.steps],
@@ -236,7 +237,7 @@ class ToolOrchestrator:
                 execution_id,
                 "source_ranked",
                 agent_name,
-                f"Ranked: {src.title[:60]} (evidence {src.evidence_score:.0%})",
+                t("source_ranked", title=src.title[:60], score=f"{src.evidence_score:.0%}"),
                 sourceId=src.id,
                 title=src.title,
                 url=src.url,
@@ -297,7 +298,7 @@ class ToolOrchestrator:
                     execution_id,
                     "evidence_collected",
                     agent_name,
-                    f"Evidence from {src.domain}: {src.title[:50]}",
+                    t("evidence_collected", domain=src.domain, title=src.title[:50]),
                     evidenceId=ev.id,
                     sourceId=src.id,
                     url=src.url,
@@ -308,7 +309,7 @@ class ToolOrchestrator:
                     execution_id,
                     "citation_attached",
                     agent_name,
-                    f"Citation [{cite.marker}] → {src.title[:50]}",
+                    t("citation_attached", marker=cite.marker, title=src.title[:50]),
                     citationId=cite.id,
                     marker=cite.marker,
                     url=src.url,
@@ -405,6 +406,7 @@ class ToolOrchestrator:
             "research_context_block",
             graph.build_context_block() + "\n\n" + citations.format_bibliography(),
         )
+        ctx.set_workflow_memory("research_pipeline_completed", True)
 
         chain_results["status"] = "completed"
         chain_results["completedAt"] = datetime.now(timezone.utc).isoformat()

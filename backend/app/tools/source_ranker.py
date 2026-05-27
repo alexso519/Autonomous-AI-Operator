@@ -25,7 +25,7 @@ class RankedSource:
     citations: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        data = {
             "id": self.id,
             "title": self.title,
             "url": self.url,
@@ -37,6 +37,9 @@ class RankedSource:
             "duplicateOf": self.duplicate_of,
             "hasFetch": bool(self.fetch_text),
         }
+        if self.fetch_text:
+            data["fetch_text"] = self.fetch_text[:8000]
+        return data
 
 
 # Domains treated as higher authority for tech/finance research

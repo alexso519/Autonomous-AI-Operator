@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any
 
+from app.config.locale import t
 from app.execution.context_manager import ContextManager
 from app.execution.execution_quality import ExecutionQualityScorer
 
@@ -100,19 +101,19 @@ class ConfidenceEngine:
         if score < cls.CRITICAL_THRESHOLD:
             triggers.append("critical_low_confidence")
             action = ConfidenceAction.SYNTHESIS_FALLBACK
-            reasoning_parts.append("Critical confidence — synthesis fallback recommended.")
+            reasoning_parts.append(t("confidence_critical"))
         elif score < cls.LOW_THRESHOLD:
             triggers.append("low_confidence")
             if "unsupported_claims" in quality.issues or quality.hallucination_risk > 0.5:
                 action = ConfidenceAction.TOOL_GROUNDING
                 triggers.append("needs_grounding")
-                reasoning_parts.append("Low confidence with factual risk — tool grounding.")
+                reasoning_parts.append(t("confidence_low_grounding"))
             elif quality.completion_confidence < 0.5:
                 action = ConfidenceAction.CLARIFICATION_RETRY
-                reasoning_parts.append("Incomplete output — clarification retry.")
+                reasoning_parts.append(t("confidence_incomplete"))
             else:
                 action = ConfidenceAction.ALTERNATE_REASONING
-                reasoning_parts.append("Low confidence — alternate reasoning path.")
+                reasoning_parts.append(t("confidence_low_alternate"))
 
         if not output or len(output.split()) < 40:
             triggers.append("thin_output")
@@ -120,7 +121,7 @@ class ConfidenceEngine:
                 action = ConfidenceAction.CLARIFICATION_RETRY
 
         if not reasoning_parts:
-            reasoning_parts.append(f"Confidence {score:.0%} within acceptable range.")
+            reasoning_parts.append(t("confidence_ok", score=f"{score:.0%}"))
 
         assessment = ConfidenceAssessment(
             node_id=node_id,

@@ -9,7 +9,7 @@ if TYPE_CHECKING:
     from app.execution.context_manager import ContextManager
 
 from app.tools.tool_execution_service import ToolExecutionService
-from app.tools.tool_models import ToolCallRequest, ToolExecutionResponse
+from app.tools.tool_models import ToolCallRequest, ToolExecutionError, ToolExecutionResponse
 
 logger = logging.getLogger(__name__)
 
@@ -73,5 +73,14 @@ async def execute_tool_request_if_present(
     request.agent_name = agent_name
 
     service = ToolExecutionService()
-    response = await service.execute_tool(request, ctx)
+    try:
+        response = await service.execute_tool(request, ctx)
+    except ToolExecutionError as exc:
+        logger.warning("Tool execution rejected for %s: %s", request.tool_name, exc)
+        response = ToolExecutionResponse(
+            status="failed",
+            tool_name=request.tool_name,
+            output=None,
+            error=str(exc),
+        )
     return ToolInvocationOutcome(request=request, response=response)

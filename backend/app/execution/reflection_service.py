@@ -228,6 +228,7 @@ class ReplanningService:
             finding.agent_name,
             decision,
             quality,
+            ctx=ctx,
         )
 
         output_hash = hashlib.sha256(finding.output.encode()).hexdigest()[:12]

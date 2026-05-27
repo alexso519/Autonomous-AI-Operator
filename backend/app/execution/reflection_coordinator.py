@@ -11,6 +11,7 @@ import hashlib
 import logging
 from typing import Any, Callable, Awaitable
 
+from app.config.locale import t
 from app.execution.context_manager import ContextManager
 from app.execution.contracts import (
     QualityResultContract,
@@ -18,7 +19,8 @@ from app.execution.contracts import (
     RetryIntent,
     RetryRequest,
 )
-from app.execution.execution_quality import ExecutionQualityScorer
+from app.execution.execution_quality import ExecutionQualityScorer, ExecutionQualityScore
+from app.tools.tool_invocation import parse_tool_request
 from app.execution.reflection_service import (
     ReflectionFinding,
     ReflectionService,
@@ -26,6 +28,7 @@ from app.execution.reflection_service import (
 )
 from app.execution.retry_coordinator import RetryCoordinator
 from app.execution.runtime_lifecycle import ExecutionPhase, LifecycleManager
+from app.execution.research_pipeline_state import is_research_pipeline_ready
 
 logger = logging.getLogger(__name__)
 
@@ -94,6 +97,35 @@ class ReflectionCoordinator:
         # No critical issues and hedging present → do not retry
         return True
 
+    @classmethod
+    def is_pipeline_evidence_suppressed(
+        cls,
+        quality: QualityResultContract,
+        ctx: ContextManager,
+        output: str,
+    ) -> bool:
+        """Pipeline-backed synthesis should not retry for missing per-node tool calls."""
+        if not is_research_pipeline_ready(ctx):
+            return False
+        if parse_tool_request(output) is not None:
+            return False
+
+        import re
+
+        word_count = len(re.findall(r"\w+", output or ""))
+        if word_count < 60:
+            return False
+
+        pipeline_tool_issues = {
+            "low_factuality",
+            "hallucination_risk",
+            "poor_tool_usage",
+            "unsupported_claims",
+        }
+        return bool(set(quality.issues) & pipeline_tool_issues) and not (
+            set(quality.issues) - pipeline_tool_issues
+        )
+
     def evaluate(self, node: dict[str, Any]) -> ReflectionOutcome:
         """
         Evaluate node output quality and decide on reflection/replanning.
@@ -113,7 +145,7 @@ class ReflectionCoordinator:
                 action="suppressed_recovery_node",
                 recovery_type="none",
                 retry_type="none",
-                reason="Recovery nodes are excluded from re-evaluation",
+                reason=t("recovery_suppressed"),
                 reasoning_trail=reasoning,
                 quality_score=0.0,
                 issues=[],
@@ -140,9 +172,9 @@ class ReflectionCoordinator:
                 action="hedge_suppressed",
                 recovery_type="none",
                 retry_count=ReflectionService._get_retry_count(node_id, self.ctx),
-                reason=(
-                    f"Quality {quality.overall_score:.0%} — hedge wording alone "
-                    "does not trigger retry on local models"
+                reason=t(
+                    "quality_hedge_suppressed",
+                    score=f"{quality.overall_score:.0%}",
                 ),
                 quality_score=quality.overall_score,
                 retry_type="none",
@@ -164,8 +196,43 @@ class ReflectionCoordinator:
                 suppression_reason="hedge_only",
             )
 
-        # Route through unified retry coordinator
         output = self.ctx.get_all_outputs().get(node_id, "").strip()
+        if self.is_pipeline_evidence_suppressed(quality, self.ctx, output):
+            reasoning.append("pipeline_evidence_suppressed")
+            finding = ReflectionFinding(
+                node_id=node_id,
+                agent_name=agent_name,
+                output=output,
+                issues=list(quality.issues),
+                should_replan=False,
+                action="pipeline_suppressed",
+                recovery_type="none",
+                retry_count=ReflectionService._get_retry_count(node_id, self.ctx),
+                reason=t(
+                    "pipeline_evidence_no_tools",
+                    score=f"{quality.overall_score:.0%}",
+                ),
+                quality_score=quality.overall_score,
+                retry_type="none",
+            )
+            ReflectionService._record_finding(finding, node, self.ctx, quality_score)
+            return ReflectionOutcome(
+                node_id=node_id,
+                agent_name=agent_name,
+                should_replan=False,
+                action="pipeline_suppressed",
+                recovery_type="none",
+                retry_type="none",
+                reason=finding.reason,
+                reasoning_trail=reasoning,
+                quality_score=quality.overall_score,
+                issues=list(quality.issues),
+                retry_count=finding.retry_count,
+                suppressed=True,
+                suppression_reason="pipeline_evidence",
+            )
+
+        # Route through unified retry coordinator
         retry_count = ReflectionService._get_retry_count(node_id, self.ctx)
 
         if quality.should_retry:
@@ -188,8 +255,12 @@ class ReflectionCoordinator:
                 retry_type = coord_result.retry_type.value if coord_result.retry_type else "none"
                 action = f"retry_{retry_type}"
                 reason = (
-                    f"Quality {quality.overall_score:.0%} — "
-                    f"{coord_result.decision.reason} → {retry_type}"
+                    t(
+                        "quality_retry",
+                        score=f"{quality.overall_score:.0%}",
+                        reason=coord_result.decision.reason,
+                        retry_type=retry_type,
+                    ),
                 )
                 reasoning.append(f"action={action}")
                 return ReflectionOutcome(
@@ -216,7 +287,11 @@ class ReflectionCoordinator:
                     action=action,
                     recovery_type="none",
                     retry_type="none",
-                    reason=f"Retry blocked: {coord_result.block_reason}. Issues: {', '.join(quality.issues)}",
+                    reason=t(
+                        "retry_blocked",
+                        reason=coord_result.block_reason,
+                        issues=", ".join(quality.issues),
+                    ),
                     reasoning_trail=reasoning,
                     quality_score=quality.overall_score,
                     issues=list(quality.issues),
@@ -226,9 +301,9 @@ class ReflectionCoordinator:
         reasoning.append("no_retry_needed")
         retry_count = ReflectionService._get_retry_count(node_id, self.ctx)
         reason = (
-            f"Quality score {quality.overall_score:.0%}: acceptable"
+            t("quality_acceptable", score=f"{quality.overall_score:.0%}")
             if quality.score and quality.score.reasons
-            else "No reflection issues detected."
+            else t("no_reflection_issues")
         )
         finding = ReflectionFinding(
             node_id=node_id,
@@ -352,7 +427,7 @@ class ReflectionCoordinator:
             self.execution_id,
             "quality_scored",
             outcome.agent_name,
-            f"Quality score: {outcome.quality_score:.0%} — {outcome.reason}",
+            t("quality_score", score=f"{outcome.quality_score:.0%}", detail=outcome.reason),
             nodeId=outcome.node_id,
             qualityScore=outcome.quality_score,
             issues=outcome.issues,
@@ -371,7 +446,11 @@ class ReflectionCoordinator:
                     self.execution_id,
                     "reflection_limit_reached",
                     "system",
-                    f"Reflection limit reached for {outcome.agent_name}: {outcome.reason}",
+                    t(
+                        "reflection_limit",
+                        agent=outcome.agent_name,
+                        reason=outcome.reason,
+                    ),
                     nodeId=outcome.node_id,
                     issues=outcome.issues,
                     qualityScore=outcome.quality_score,
@@ -417,8 +496,12 @@ class ReflectionCoordinator:
         await self.ctx.persist()
 
         message = (
-            f"Quality {outcome.quality_score:.0%} for {outcome.agent_name}. "
-            f"Injected {outcome.retry_type} recovery step."
+            t(
+                "injected_recovery",
+                score=f"{outcome.quality_score:.0%}",
+                agent=outcome.agent_name,
+                retry_type=outcome.retry_type,
+            ),
         )
         await emit_fn(
             self.execution_id,

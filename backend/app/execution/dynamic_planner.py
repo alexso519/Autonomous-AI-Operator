@@ -9,6 +9,7 @@ import re
 import uuid
 from typing import Any, Awaitable, Callable
 
+from app.config.locale import t
 from app.execution.adaptive_graph import AdaptiveExecutionGraph, GraphMutation
 from app.execution.context_manager import ContextManager
 from app.execution.hierarchical_memory import HierarchicalMemory
@@ -23,9 +24,12 @@ EmitFn = Callable[..., Awaitable[None]]
 class DynamicPlanner:
     """Runtime planner: strategies, decomposition, and adaptive replanning."""
 
+    MAX_RUNTIME_SPAWNED = 2
+
     SUBGOAL_PATTERN = re.compile(
         r"(?i)(?:step\s*\d+|phase\s*\d+|first|second|then|also|additionally)[:\s]+([^.!\n]{20,120})"
     )
+    TOOL_JSON_PATTERN = re.compile(r'"tool_name"\s*:')
 
     @classmethod
     async def initialize_execution(
@@ -88,7 +92,7 @@ class DynamicPlanner:
             execution_id,
             "strategy_selected",
             "system",
-            f"Selected strategy: {strategy.label} (score {strategy.composite_score:.0%})",
+            t("selected_strategy", label=strategy.label, score=f"{strategy.composite_score:.0%}"),
             strategyId=strategy.id,
             strategyLabel=strategy.label,
             approach=strategy.approach,
@@ -104,7 +108,7 @@ class DynamicPlanner:
                 execution_id,
                 "graph_mutated",
                 "system",
-                f"Decomposed task into {len(decomposed)} subgoal node(s)",
+                t("decomposed_subgoals", count=len(decomposed)),
                 mutation=mutation.to_dict() if mutation else {},
                 nodeIds=[n["id"] for n in decomposed],
                 action="decompose",
@@ -148,19 +152,77 @@ class DynamicPlanner:
         return spawned
 
     @classmethod
-    def _extract_subgoals(cls, objective: str) -> list[str]:
+    def _looks_like_tool_or_json(cls, text: str) -> bool:
+        """True when text is a tool request payload, not natural-language subgoals."""
+        stripped = text.strip()
+        if not stripped:
+            return True
+        if cls.TOOL_JSON_PATTERN.search(stripped):
+            return True
+        if stripped.startswith("{") and "input_data" in stripped:
+            return True
+        return False
+
+    @classmethod
+    def _is_valid_subgoal(cls, text: str) -> bool:
+        if len(text.strip()) <= 20:
+            return False
+        if cls._looks_like_tool_or_json(text):
+            return False
+        if "{" in text or "}" in text:
+            return False
+        if '"' in text and ":" in text:
+            return False
+        if text.lstrip().startswith("#"):
+            return False
+        if text.count(".") >= 2 and len(text) > 120:
+            return False
+        return True
+
+    @classmethod
+    def _looks_like_completed_report(cls, text: str) -> bool:
+        """Agent already produced a structured answer — do not decompose further."""
+        stripped = text.strip()
+        if not stripped:
+            return False
+        if re.search(r"^#{1,3}\s+\S", stripped, re.MULTILINE):
+            return True
+        if re.search(r"^\*\*[^*]+\*\*", stripped, re.MULTILINE):
+            return True
+        if len(re.findall(r"\w+", stripped)) >= 80:
+            return True
+        return False
+
+    @classmethod
+    def _extract_explicit_subgoals(cls, text: str) -> list[str]:
+        """Match only explicit step/phase markers — safe for agent outputs."""
+        if cls._looks_like_tool_or_json(text):
+            return []
+
         found: list[str] = []
-        for match in cls.SUBGOAL_PATTERN.finditer(objective):
-            text = match.group(1).strip()
-            if len(text) > 15:
-                found.append(text)
+        for match in cls.SUBGOAL_PATTERN.finditer(text):
+            candidate = match.group(1).strip()
+            if cls._is_valid_subgoal(candidate):
+                found.append(candidate)
+        return found[:3]
+
+    @classmethod
+    def _extract_subgoals(cls, objective: str) -> list[str]:
+        """Decompose workflow objectives (may split on 'and' for multi-part goals)."""
+        if cls._looks_like_tool_or_json(objective):
+            return []
+
+        found = cls._extract_explicit_subgoals(objective)
         if len(found) >= 2:
             return found
 
         if " and " in objective.lower() and len(objective) > 60:
             parts = re.split(r"\s+and\s+", objective, maxsplit=2, flags=re.IGNORECASE)
             if len(parts) >= 2:
-                return [p.strip() for p in parts if len(p.strip()) > 20][:3]
+                return [
+                    p.strip() for p in parts
+                    if cls._is_valid_subgoal(p)
+                ][:3]
         return []
 
     @classmethod
@@ -183,7 +245,7 @@ class DynamicPlanner:
             execution_id,
             "replanning_started",
             "system",
-            f"Replanning after {finding.agent_name}: {finding.reason}",
+            t("replanning_after", agent=finding.agent_name, reason=finding.reason),
             nodeId=finding.node_id,
             issues=finding.issues,
             qualityScore=finding.quality_score,
@@ -236,7 +298,7 @@ class DynamicPlanner:
                 execution_id,
                 "graph_mutated",
                 "system",
-                f"Graph updated: {len(new_nodes)} recovery node(s) inserted",
+                t("graph_updated", count=len(new_nodes)),
                 mutation=mutation.to_dict(),
                 nodeIds=new_node_ids,
                 action="recovery_insert",
@@ -246,7 +308,7 @@ class DynamicPlanner:
             execution_id,
             "replanning_completed",
             "system",
-            f"Replanning complete — {len(updated)} nodes in execution plan",
+            t("replanning_complete", count=len(updated)),
             nodeId=finding.node_id,
             totalNodes=len(updated),
             injectedNodes=new_node_ids,
@@ -268,7 +330,17 @@ class DynamicPlanner:
         if node.get("data", {}).get("executionMetadata", {}).get("subgoal"):
             return []
 
-        subgoals = cls._extract_subgoals(output)
+        if cls._looks_like_tool_or_json(output):
+            return []
+
+        if cls._looks_like_completed_report(output):
+            return []
+
+        spawned_count = int(ctx.get_workflow_memory("runtime_spawned_count") or 0)
+        if spawned_count >= cls.MAX_RUNTIME_SPAWNED:
+            return []
+
+        subgoals = cls._extract_explicit_subgoals(output)
         if len(subgoals) < 2:
             return []
 
@@ -280,9 +352,13 @@ class DynamicPlanner:
                 execution_id,
                 "child_agent_spawned",
                 "system",
-                f"Spawned child agent for subgoal: {subgoal[:80]}",
+                t("spawned_child_agent", subgoal=subgoal[:80]),
                 parentNodeId=node.get("id"),
                 childNodeId=child["id"],
                 subgoal=subgoal,
             )
+        ctx.set_workflow_memory(
+            "runtime_spawned_count",
+            spawned_count + len(spawned),
+        )
         return spawned

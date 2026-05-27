@@ -36,7 +36,13 @@ class AutonomousExecutionService:
         self._planner = get_planner()
         self._analyzer = get_analyzer()
 
-    async def start(self, objective: str, workflow_name: str | None = None) -> dict[str, Any]:
+    async def start(
+        self,
+        objective: str,
+        workflow_name: str | None = None,
+        *,
+        model_config: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         """Analyze, plan, persist workflow and start execution.
 
         Returns a dict with keys: executionId, workflowId, workflowName,
@@ -96,6 +102,41 @@ class AutonomousExecutionService:
             if n.get("type", n.get("data", {}).get("nodeType")) != "approval":
                 n.setdefault("data", {})["taskComplexity"] = analysis.complexity.value
                 break
+
+        # 2c. Apply user-selected model settings (server-validated in routes).
+        forced_model = None
+        forced_provider = None
+        forced_temperature = None
+        forced_max_tokens = None
+        if model_config:
+            maybe_provider = model_config.get("provider")
+            maybe_model = model_config.get("model")
+            maybe_temp = model_config.get("temperature")
+            maybe_max_tokens = model_config.get("maxTokens")
+            if isinstance(maybe_provider, str) and maybe_provider.strip():
+                forced_provider = maybe_provider.strip().lower()
+            if isinstance(maybe_model, str) and maybe_model.strip():
+                forced_model = maybe_model.strip()
+            if isinstance(maybe_temp, (int, float)):
+                forced_temperature = float(maybe_temp)
+            if isinstance(maybe_max_tokens, (int, float)):
+                forced_max_tokens = int(maybe_max_tokens)
+
+        if forced_provider or forced_model or forced_temperature is not None or forced_max_tokens is not None:
+            for n in nodes:
+                node_type = n.get("type", n.get("data", {}).get("nodeType"))
+                if node_type == "approval":
+                    continue
+                data = n.setdefault("data", {})
+                if forced_provider:
+                    data["forcedProvider"] = forced_provider
+                if forced_model:
+                    # Read by build_agent_routed to bypass adaptive router.
+                    data["forcedModel"] = forced_model
+                if forced_temperature is not None:
+                    data["temperature"] = forced_temperature
+                if forced_max_tokens is not None:
+                    data["maxTokens"] = forced_max_tokens
 
         # 3. Persist workflow
         workflow_id = str(uuid.uuid4())

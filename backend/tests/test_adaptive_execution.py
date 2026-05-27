@@ -141,6 +141,37 @@ def test_dynamic_planner_extracts_subgoals():
     assert isinstance(subgoals, list)
 
 
+def test_dynamic_planner_rejects_tool_json_as_subgoals():
+    tool_output = (
+        '{"tool_name": "web_search", "input_data": {"query": '
+        '"Research NVIDIA Blackwell and generate an investment summary"}}'
+    )
+    assert DynamicPlanner._extract_subgoals(tool_output) == []
+    assert DynamicPlanner._extract_explicit_subgoals(tool_output) == []
+
+
+def test_dynamic_planner_rejects_completed_report_as_subgoals():
+    report = (
+        "### Summary\n"
+        "Based on cross-checked source material, NVIDIA's transition to the "
+        "Blackwell architecture substantiates a foundational business model shift. "
+        "Key claims regarding superior system economics, full-stack competitive moats, "
+        "and FY2026 financial scaling are strongly supported by fetched evidence."
+    )
+    assert DynamicPlanner._looks_like_completed_report(report)
+    assert DynamicPlanner._extract_explicit_subgoals(report) == []
+
+
+def test_dynamic_planner_accepts_natural_language_and_split():
+    objective = (
+        "First gather authoritative sources on NVIDIA Blackwell architecture details "
+        "and second produce a concise investment summary with risks and recommendations"
+    )
+    subgoals = DynamicPlanner._extract_subgoals(objective)
+    assert len(subgoals) >= 2
+    assert all("{" not in s for s in subgoals)
+
+
 def test_synthesizer_detects_conflicts():
     conflicts = _detect_conflicts([
         ("Bull Agent", "Strong growth and bullish outlook for the sector."),

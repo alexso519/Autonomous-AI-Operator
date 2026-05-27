@@ -13,6 +13,23 @@ from app.tools.tool_invocation import (
     execute_tool_request_if_present,
     parse_tool_request,
 )
+from app.tools.tool_input_normalizer import normalize_tool_input
+
+
+def test_normalize_web_search_queries_list():
+    normalized = normalize_tool_input(
+        "web_search",
+        {"queries": ["NVIDIA Blackwell microarchitecture", "earnings multiple 2026"]},
+    )
+    assert normalized == {"query": "NVIDIA Blackwell microarchitecture"}
+
+
+def test_normalize_web_search_search_query_alias():
+    normalized = normalize_tool_input(
+        "web_search",
+        {"search_query": "NVIDIA Blackwell investment thesis"},
+    )
+    assert normalized["query"] == "NVIDIA Blackwell investment thesis"
 
 
 def test_parse_tool_request_valid_json():

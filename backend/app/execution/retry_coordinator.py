@@ -153,7 +153,7 @@ class RetryCoordinator:
         quality: ExecutionQualityScore,
     ) -> str:
         return RetryPolicy.build_recovery_goal(
-            original_goal, agent_name, decision, quality
+            original_goal, agent_name, decision, quality, ctx=self.ctx
         )
 
     def _build_dedupe_key(self, request: RetryRequest) -> str:

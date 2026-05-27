@@ -13,6 +13,7 @@ from enum import Enum
 from typing import Any
 
 from app.execution.context_manager import ContextManager
+from app.execution.context_manager import ContextManager
 from app.execution.execution_quality import ExecutionQualityScore
 
 logger = logging.getLogger(__name__)
@@ -42,6 +43,15 @@ class RetryPolicy:
 
     GLOBAL_RETRY_BUDGET = 5
     PER_NODE_MAX = 2
+
+    RETRY_HINT_LABELS: dict[str, str] = {
+        "clarify_goal_and_retry": "task scope and explicit assumptions",
+        "expand_with_missing_sections": "Summary, Findings, Recommendations, and Next Steps",
+        "summarize_and_deduplicate": "a concise deduplicated summary",
+        "use_tools_for_facts": "tool-verified facts with [n] citations",
+        "invoke_web_search_first": "web_search and webpage_fetch evidence",
+        "add_actionable_recommendations": "actionable recommendations",
+    }
 
     ISSUE_TO_RETRY: dict[str, RetryType] = {
         "empty_output": RetryType.CLARIFY,
@@ -183,7 +193,24 @@ class RetryPolicy:
         agent_name: str,
         decision: RetryDecision,
         quality: ExecutionQualityScore,
+        ctx: ContextManager | None = None,
     ) -> str:
+        from app.execution.research_pipeline_state import is_research_pipeline_ready
+
+        if (
+            ctx is not None
+            and is_research_pipeline_ready(ctx)
+            and decision.retry_type in (RetryType.FACTUAL_RETRY, RetryType.TOOL_RETRY)
+        ):
+            return (
+                f"Retry for {agent_name}. Pre-collected research evidence is already in context.\n"
+                f"Original goal: {original_goal}\n\n"
+                "Synthesize from the provided evidence. Write markdown prose with "
+                "Summary, Findings, Recommendations, and Next Steps.\n"
+                "Do NOT call web_search, webpage_fetch, or emit JSON tool requests.\n"
+                f"{decision.prompt_suffix}"
+            )
+
         if decision.goal_override:
             return decision.goal_override
 
@@ -238,11 +265,14 @@ class RetryPolicy:
             )
 
         if retry_type == RetryType.EXPAND:
-            missing = ", ".join(quality.retry_hints) or "missing sections"
+            missing = ", ".join(
+                cls.RETRY_HINT_LABELS.get(h, h.replace("_", " "))
+                for h in quality.retry_hints
+            ) or "missing sections"
             return (
                 duplicate_warning
-                + f"Expand the prior output. Add missing sections: {missing}. "
-                "Include clear headings: Summary, Findings, Recommendations, Next Steps. "
+                + f"Expand the prior output. Address: {missing}. "
+                "Use clear headings: Summary, Findings, Recommendations, Next Steps. "
                 "Be thorough but avoid filler.",
                 None,
                 "expand_missing_sections",

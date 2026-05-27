@@ -37,7 +37,51 @@ class ToolExecutionService:
         ctx: ContextManager | None = None,
     ) -> ToolExecutionResponse:
         definition = self._get_definition(request.tool_name)
+        from app.tools.tool_input_normalizer import normalize_tool_input
+
+        normalized_input = normalize_tool_input(
+            definition.name, dict(request.input_data)
+        )
+        request = request.model_copy(update={"input_data": normalized_input})
         input_obj = self._validate_request(definition, request)
+
+        pipeline_output = self._reuse_research_pipeline_tool(
+            definition.name, request.input_data, ctx
+        )
+        if pipeline_output is not None:
+            await self._persist_tool_call(
+                request,
+                definition,
+                status="completed",
+                output=pipeline_output,
+                error=None,
+                approved=True,
+                auto_approved=True,
+            )
+            self._record_in_context(
+                ctx,
+                request,
+                definition,
+                status="completed",
+                output=pipeline_output,
+                error=None,
+                auto_approved=True,
+            )
+            if ctx is not None and request.execution_id:
+                await self._emit_efficiency_event(
+                    request.execution_id,
+                    definition.name,
+                    request.agent_name or "tool",
+                    "pipeline_reuse",
+                    "research_pipeline",
+                )
+            return ToolExecutionResponse(
+                status="completed",
+                tool_name=definition.name,
+                output=pipeline_output,
+                error=None,
+                approval_payload=None,
+            )
 
         # Tool efficiency: cache hit / duplicate suppression
         from app.tools.tool_efficiency import ToolEfficiencyLayer
@@ -246,6 +290,54 @@ class ToolExecutionService:
                 error=error_message,
             )
             raise ToolExecutionError(error_message) from exc
+
+    def _reuse_research_pipeline_tool(
+        self,
+        tool_name: str,
+        input_data: dict[str, Any],
+        ctx: ContextManager | None,
+    ) -> dict[str, Any] | None:
+        """Return cached research pipeline data instead of redundant network calls."""
+        from app.execution.research_pipeline_state import is_research_pipeline_ready
+
+        if ctx is None or not is_research_pipeline_ready(ctx):
+            return None
+
+        if tool_name == "web_search":
+            from app.execution.research_memory import ResearchMemory
+
+            sources = ResearchMemory(ctx)._store().get("sources") or []
+            if not sources:
+                return None
+            results = [
+                {
+                    "title": s.get("title", ""),
+                    "url": s.get("url", ""),
+                    "snippet": s.get("snippet") or s.get("fetch_text", "")[:300],
+                }
+                for s in sources[:8]
+            ]
+            return {
+                "query": str(input_data.get("query", "")),
+                "results": results,
+                "source": "research_pipeline_cache",
+            }
+
+        if tool_name == "webpage_fetch":
+            url = str(input_data.get("url", "")).strip()
+            if not url:
+                return None
+            from app.execution.research_memory import ResearchMemory
+
+            for src in ResearchMemory(ctx)._store().get("sources") or []:
+                if src.get("url") == url and (src.get("fetch_text") or src.get("snippet")):
+                    return {
+                        "url": url,
+                        "title": src.get("title", ""),
+                        "text": (src.get("fetch_text") or src.get("snippet", ""))[:50000],
+                        "source": "research_pipeline_cache",
+                    }
+        return None
 
     def _get_definition(self, tool_name: str) -> ToolDefinition:
         try:
